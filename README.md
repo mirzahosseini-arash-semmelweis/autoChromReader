@@ -161,18 +161,7 @@ Metadata parsing is intentionally separated from file decoding. Users with diffe
 
 Implements FlatFit baseline estimation based on the method introduced in MOCCA2, together with extensions intended for long and densely sampled chromatograms.
 
-Flatness weights are determined from local slope and curvature, and the baseline is obtained by solving
-
-$$
-\widehat{b}
-=
-\operatorname*{arg\,min}_{b}
-\left[
-(y-b)^\mathrm{T}W(y-b)
-+
-\lambda \left\|\Delta^2b\right\|_2^2
-\right].
-$$
+Flatness weights are determined from local slope and curvature.
 
 The default implementation estimates the Savitzky--Golay window from the chromatographic feature scale and can optionally perform a small number of asymmetric refinement steps.
 
@@ -501,12 +490,6 @@ If you use `autoChromReader` in published work, please cite the associated publi
 > **[Citation to be added upon publication]**
 
 The workflow additionally builds upon methods and software including FlatFit/MOCCA2, MILE, `chromConverter`, continuous-wavelet peak detection, and exponential-Gaussian hybrid peak modeling. Please refer to the manuscript and repository references for the relevant primary publications.
-
----
-
-## License
-
-**[Choose and add a license before public release; e.g. MIT, GPL-3, or another appropriate open-source license.]**
 
 ---
 
