@@ -1,6 +1,5 @@
 ## ---------------------------------------------------------------------------
 ##  peakfinder.R -- Folder-level HPLC retention/FWHM extraction pipeline.
-##
 ## ---------------------------------------------------------------------------
 
 suppressWarnings(
@@ -17,43 +16,6 @@ suppressWarnings(
 )
 
 PEAKFINDER_VERSION <- "0.4.0"
-
-# ---------- Requirements ------------------------------------------------------
-
-assert_peak_engines <- function() {
-  missing <- character()
-  if (!exists("read_chrom_file", mode = "function", inherits = TRUE)) {
-    missing <- c(missing, "read_chrom_file() from read_chrom.R")
-  }
-  if (!exists("read_chrom_folder", mode = "function", inherits = TRUE)) {
-    missing <- c(missing, "read_chrom_folder() from read_chrom.R")
-  }
-  if (!exists("flatfit", mode = "function", inherits = TRUE)) {
-    missing <- c(missing, "mile() from baseline_flatfit.R")
-  }
-  if (!exists("mile", mode = "function", inherits = TRUE)) {
-    missing <- c(missing, "mile() from baseline_mile.R")
-  }
-  if (!exists("pick_peaks", mode = "function", inherits = TRUE)) {
-    missing <- c(missing, "pick_peaks() from pick_peaks.R")
-  }
-  if (!exists("noise_profile", mode = "function", inherits = TRUE)) {
-    missing <- c(missing, "noise_profile() from pick_peaks.R")
-  }
-  if (!exists("deconvolve_clusters", mode = "function", inherits = TRUE)) {
-    missing <- c(missing, "deconvolve_clusters() from pick_peaks.R")
-  }
-
-  if (length(missing)) {
-    stop(
-      "Required peak-engine functions are not available. Source baseline_mile.R ",
-      "first, then pick_peaks.R, then this peakfinder file. Missing: ",
-      paste(missing, collapse = ", ")
-    )
-  }
-
-  invisible(TRUE)
-}
 
 # ---------- Lookup ------------------------------------------------------------
 
@@ -74,16 +36,41 @@ write_peak_lookup_template <- function(
   }
 
   runs <- unique(data[, .(
-    filename, date, wavelength_nm, experimentalID, compoundname,
-    columnID, eluentID, modifierID, temp_C, flow_mL_min
+    record_uid,
+    filename,
+    date,
+    wavelength_nm,
+    experimentalID,
+    compoundname,
+    columnID,
+    eluentID,
+    modifierID,
+    temp_C,
+    flow_mL_min
   )])
-  setorder(runs, filename)
+  
+  setorder(runs, filename, wavelength_nm)
 
-  template <- runs[, .(filename)]
+  template <- runs[, .(
+    record_uid,
+    filename,
+    wavelength_nm,
+    experimentalID,
+    compoundname
+  )]
+  
+  setorder(
+    template,
+    filename,
+    wavelength_nm
+  )
+  
   template[, t0 := NA_real_]
+  
   for (j in seq_len(max_peaks)) {
     template[, (paste0("t", j)) := NA_real_]
   }
+  
   template[, `:=`(
     expected_npeaks = NA_integer_,
     exclude         = NA,
@@ -101,11 +88,11 @@ read_peak_lookup <- function(path, filename = "peakfinder_lookup.csv") {
   }
 
   x <- fread(f, na.strings = c("", "NA"))
-  if (!"filename" %in% names(x)) {
-    stop("Lookup table must contain a 'filename' column.")
+  if (!"record_uid" %in% names(x)) {
+    stop("Lookup table must contain a 'record_uid' column.")
   }
-  if (anyDuplicated(x$filename)) {
-    stop("Lookup table contains duplicate filename rows.")
+  if (anyDuplicated(x$record_uid)) {
+    stop("Lookup table contains duplicate record_uid rows.")
   }
 
   tcols <- grep("^t[0-9]+$", names(x), value = TRUE)
@@ -234,8 +221,6 @@ preprocess_chromatogram <- function(
     mile_mollify_min_base_hw = 8L
   ) {
 
-  assert_peak_engines()
-  
   baseline_method <- match.arg(baseline_method)
 
   d <- copy(d)[order(time_min)]
@@ -309,7 +294,6 @@ preprocess_chromatogram <- function(
     )]
     
     attr(d, "mile_result") <- mf
-    
   }
   
   d[]
@@ -372,7 +356,7 @@ nearest_picker_peak <- function(pk, hint_min, window_min = 0.10) {
   ii <- which(abs(pk$rt - hint_min) <= window_min)
   if (!length(ii)) return(NA_integer_)
 
-  dd <- abs(pk$rt[ii] - hint_min)
+  dd   <- abs(pk$rt[ii] - hint_min)
   best <- ii[dd == min(dd)]
   if (length(best) > 1L) {
     best <- best[which.max(pk$height[best])]
@@ -514,21 +498,21 @@ standardize_manual_peak <- function(
   n   <- nrow(proc)
 
   selected_indices <- sort(unique(as.integer(selected_indices)))
-  pos <- match(idx, selected_indices)
+  pos              <- match(idx, selected_indices)
 
   if (is.na(pos) || pos == 1L) {
     left_bound <- 1L
   } else {
-    prev <- selected_indices[pos - 1L]
-    rr   <- prev:idx
+    prev       <- selected_indices[pos - 1L]
+    rr         <- prev:idx
     left_bound <- rr[which.min(y[rr])]
   }
 
   if (is.na(pos) || pos == length(selected_indices)) {
     right_bound <- n
   } else {
-    nxt <- selected_indices[pos + 1L]
-    rr  <- idx:nxt
+    nxt         <- selected_indices[pos + 1L]
+    rr          <- idx:nxt
     right_bound <- rr[which.min(y[rr])]
   }
 
@@ -550,10 +534,7 @@ standardize_manual_peak <- function(
     apex_intensity       = raw[idx],
     height               = y[idx],
     prominence           = NA_real_,
-    area                 = trapz_base(
-      t[left_bound:right_bound],
-      pmax(y[left_bound:right_bound], 0)
-    ),
+    area                 = trapz_base(t[left_bound:right_bound], pmax(y[left_bound:right_bound], 0)),
     SNR                  = y[idx] / noise_sd,
     left_bound_min       = t[left_bound],
     right_bound_min      = t[right_bound],
@@ -565,8 +546,7 @@ standardize_manual_peak <- function(
     half_level_raw       = proc$baseline[idx] + hc$half,
     fwhm_clean           = is.finite(hc$fwhm),
     overlap_flag         = left_overlap || right_overlap,
-    edge_peak            = (!is.finite(hc$left) && left_bound == 1L) ||
-                              (!is.finite(hc$right) && right_bound == n),
+    edge_peak            = (!is.finite(hc$left) && left_bound == 1L) || (!is.finite(hc$right) && right_bound == n),
     saturated            = saturated,
     picker_type          = "manual",
     picker_cluster       = NA_integer_,
@@ -781,7 +761,6 @@ analyze_one_chromatogram <- function(
     deconv_require_same_count = TRUE
   ) {
 
-  assert_peak_engines()
   baseline_method <- match.arg(baseline_method)
   stopifnot(length(unique(d$record_uid)) == 1L)
 
@@ -875,7 +854,7 @@ analyze_one_chromatogram <- function(
     NA_real_
   }
   
-  lv <- .lookup_values(lookup)
+  lv              <- .lookup_values(lookup)
   excluded        <- lv$excluded
   lookup_note     <- lv$note
   expected_npeaks <- lv$expected_npeaks
@@ -904,10 +883,10 @@ analyze_one_chromatogram <- function(
     if (is.finite(lookup_t0)) {
       j <- nearest_picker_peak(pk, lookup_t0, manual_window_min)
       if (is.finite(j)) {
-        t0_picker_row  <- j
+        t0_picker_row   <- j
         t0_marker_found <- TRUE
-        t0_value_min   <- pk$rt[j]
-        t0_source      <- "manual_hint_marker"
+        t0_value_min    <- pk$rt[j]
+        t0_source       <- "manual_hint_marker"
       } else {
         ii <- snap_to_local_apex(proc, lookup_t0, manual_window_min)
         if (is.finite(ii)) {
@@ -952,10 +931,7 @@ analyze_one_chromatogram <- function(
   ca <- if (nrow(pk)) pk[rt > analyte_lower_limit] else data.table()
 
   if (nrow(ca)) {
-    ca <- ca[
-      snr >= effective_analyte_snr_min &
-        height >= relative_height_min * max_analyte_signal
-    ]
+    ca <- ca[snr >= effective_analyte_snr_min & height >= relative_height_min * max_analyte_signal]
 
     ca <- suppress_close_picker_peaks(
       ca,
@@ -1173,10 +1149,7 @@ analyze_one_chromatogram <- function(
   if (nrow(peaks)) {
     peaks[, k := NA_real_]
     if (t0_available) {
-      peaks[
-        peak_type == "analyte",
-        k := (tR_min - t0_value_min) / t0_value_min
-      ]
+      peaks[peak_type == "analyte", k := (tR_min - t0_value_min) / t0_value_min]
     }
   }
 
@@ -1201,10 +1174,10 @@ analyze_one_chromatogram <- function(
   saturated_any <- nrow(peaks[peak_type == "analyte"]) > 0L &&
     any(peaks[peak_type == "analyte", saturated])
 
-  clustered_any <- length(deconv_info$attempted_clusters) > 0L
-  deconvolution_applied_any <- length(deconv_info$accepted_clusters) > 0L
+  clustered_any                        <- length(deconv_info$attempted_clusters) > 0L
+  deconvolution_applied_any            <- length(deconv_info$accepted_clusters) > 0L
   deconvolution_count_disagreement_any <- length(deconv_info$disagreement_clusters) > 0L
-  deconvolution_failed_any <- length(deconv_info$failed_clusters) > 0L
+  deconvolution_failed_any             <- length(deconv_info$failed_clusters) > 0L
 
   qc_status <- if (excluded) {
     "excluded"
@@ -1278,8 +1251,7 @@ analyze_one_chromatogram <- function(
     deconvolution_applied_any,
     deconvolution_count_disagreement_any,
     deconvolution_failed_any,
-    peak_detection_ok = n_peaks >= 1L && !excluded &&
-      (!look_for_t0 || t0_marker_found || t0_available),
+    peak_detection_ok = n_peaks >= 1L && !excluded && (!look_for_t0 || t0_marker_found || t0_available),
     noise_sd,
     max_analyte_signal,
     snr_min_absolute          = snr_min,
@@ -1312,7 +1284,12 @@ plot_peak_qc <- function(result) {
 
   p <- ggplot(d, aes(time_min, intensity_corrected)) +
     geom_line(linewidth = 0.35) +
-    geom_line(aes(y = baseline), linewidth = 0.3, linetype = 2, color = "deepskyblue") +
+    geom_line(
+      aes(y = baseline),
+      linewidth = 0.3,
+      linetype  = 2,
+      color     = "deepskyblue"
+    ) +
     labs(
       title    = d$filename[1L],
       subtitle = paste0(
@@ -1426,7 +1403,18 @@ save_peak_qc <- function(
   ) {
 
   dir.create(qc_dir, recursive = TRUE, showWarnings = FALSE)
-  stem    <- tools::file_path_sans_ext(result$processed_trace$filename[1L])
+  stem <- tools::file_path_sans_ext(result$processed_trace$filename[1L])
+  wl   <- result$processed_trace$wavelength_nm[1L]
+  
+  if (is.finite(wl)) {
+    stem <- paste0(
+      stem,
+      "_",
+      format(wl, trim = TRUE, scientific = FALSE),
+      "nm"
+    )
+  }
+  
   outfile <- file.path(qc_dir, paste0(stem, "_peakQC.png"))
 
   ggsave(
@@ -1584,12 +1572,7 @@ snap_cross_wavelength_consensus <- function(peaks, rt_tolerance_min = 0.05) {
     for (j in seq_len(nrow(maj))) {
       
       cid <- maj$consensus_cluster[j]
-      
-      ids <- z[
-        consensus_cluster == cid,
-        .row_id__
-      ]
-      
+      ids <- z[consensus_cluster == cid, .row_id__]
       matched_ids <- c(matched_ids, ids)
       
       x[
@@ -1605,15 +1588,8 @@ snap_cross_wavelength_consensus <- function(peaks, rt_tolerance_min = 0.05) {
       ]
     }
     
-    n_reindexed <- x[
-      .row_id__ %in% matched_ids,
-      sum(peak_index != peak_index_original)
-    ]
-    
-    n_unmatched <- x[
-      .row_id__ %in% ii,
-      sum(!use_for_retention)
-    ]
+    n_reindexed <- x[.row_id__ %in% matched_ids, sum(peak_index != peak_index_original)]
+    n_unmatched <- x[.row_id__ %in% ii, sum(!use_for_retention)]
     
     qc_list[[g]] <- data.table(
       date                               = groups$date[g],
@@ -1624,8 +1600,7 @@ snap_cross_wavelength_consensus <- function(peaks, rt_tolerance_min = 0.05) {
       consensus_n_reindexed              = n_reindexed,
       consensus_n_unmatched              = n_unmatched,
       cross_wavelength_consensus_applied = TRUE,
-      cross_wavelength_consensus_status  =
-        if (n_reindexed > 0L) "reindexed" else "already_aligned"
+      cross_wavelength_consensus_status  = if (n_reindexed > 0L) "reindexed" else "already_aligned"
     )
   }
   
@@ -1642,9 +1617,7 @@ snap_cross_wavelength_consensus <- function(peaks, rt_tolerance_min = 0.05) {
     peaks = x[],
     
     ## This is what should feed make_retention_table().
-    peaks_for_retention = x[
-      use_for_retention == TRUE
-    ],
+    peaks_for_retention = x[use_for_retention == TRUE],
     
     qc = qc
   )
@@ -1854,28 +1827,18 @@ assemble_analysis_result <- function(
   }
 
   if (isTRUE(snap_to_cross_wavelength_consensus) && nrow(peaks)) {
-    
-    consensus <- snap_cross_wavelength_consensus(
-      peaks,
-      rt_tolerance_min = cross_wavelength_tolerance_min
-    )
+    consensus <- snap_cross_wavelength_consensus(peaks, rt_tolerance_min = cross_wavelength_tolerance_min)
     
     peaks_consensus     <- consensus$peaks
     peaks_for_retention <- consensus$peaks_for_retention
     consensus_qc        <- consensus$qc
-    
   } else {
-    
     peaks_consensus     <- NULL
     peaks_for_retention <- peaks
     consensus_qc        <- data.table()
   }
   
-  
-  retention <- make_retention_table(
-    runs,
-    peaks_for_retention
-  )
+  retention <- make_retention_table(runs, peaks_for_retention)
   
   retention <- add_cross_wavelength_qc(
     retention,
@@ -1883,15 +1846,14 @@ assemble_analysis_result <- function(
     rt_tolerance_min = cross_wavelength_tolerance_min
   )
   
-  
   if (nrow(consensus_qc)) {
     
     retention <- merge(
       retention,
       consensus_qc,
-      by = c("date", "experimentalID"),
+      by    = c("date", "experimentalID"),
       all.x = TRUE,
-      sort = FALSE
+      sort  = FALSE
     )
   }
 
@@ -2051,14 +2013,14 @@ analyze_chrom_folder <- function(
     reader_args                        = list()
   ) {
 
-  assert_peak_engines()
-
   path <- normalizePath(path, winslash = "/", mustWork = TRUE)
   raw  <- do.call(read_chrom_folder, c(list(path), reader_args))
-  dup  <- raw[, .N, by = .(filename, record_uid)][, .N, by = filename][N > 1L]
-  if (nrow(dup)) {
-    stop("Duplicate filenames map to different records; split by record_uid or ",
-         "rename: ", paste(dup$filename, collapse = ", "))
+  
+  record_map <- unique(raw[, .(record_uid, filename, wavelength_nm)])
+  bad_uid    <- record_map[, .N, by = record_uid][N > 1L]
+  
+  if (nrow(bad_uid)) {
+    stop("A record_uid maps to more than one chromatographic record.")
   }
 
   ## Important: the initial analysis never consumes the lookup table. The lookup
@@ -2103,10 +2065,16 @@ analyze_chrom_folder <- function(
     deconv_require_same_count = deconv_require_same_count
   )
 
-  files <- unique(raw$filename)
+  record_ids <- unique(raw$record_uid)
+  
   chrom <- setNames(
-    lapply(files, function(f) raw[filename == f]),
-    files
+    lapply(
+      record_ids,
+      function(id) {
+        raw[record_uid == id]
+      }
+    ),
+    record_ids
   )
 
   worker <- function(dd) {
@@ -2123,8 +2091,9 @@ analyze_chrom_folder <- function(
     seed      = seed,
     progress  = progress
   )
-  names(results) <- files
-
+  
+  names(results) <- record_ids
+  
   if (isTRUE(save_qc)) {
     qc_dir <- file.path(path, qc_subdir)
     for (i in seq_along(results)) {
@@ -2173,13 +2142,10 @@ update_with_lookup <- function(
   ## every row. A FALSE becomes actionable only if that run is currently marked
   ## excluded in the result being updated.
   if ("exclude" %in% names(lookup) && "excluded" %in% names(result$runs)) {
-    currently_excluded <- result$runs[excluded == TRUE, unique(filename)]
-    unexclude <- lookup[
-      !is.na(exclude) & exclude == FALSE & filename %in% currently_excluded
-    ]
+    currently_excluded <- result$runs[excluded == TRUE, unique(record_uid)]
+    unexclude <- lookup[!is.na(exclude) & exclude == FALSE & record_uid %in% currently_excluded]
     if (nrow(unexclude)) {
-      active <- unique(rbindlist(list(active, unexclude), use.names = TRUE, fill = TRUE),
-                       by = "filename")
+      active <- unique(rbindlist(list(active, unexclude), use.names = TRUE, fill = TRUE), by = "record_uid")
     }
   }
 
@@ -2188,8 +2154,8 @@ update_with_lookup <- function(
     return(result)
   }
 
-  known <- names(result$results)
-  unknown <- setdiff(active$filename, known)
+  known   <- names(result$results)
+  unknown <- setdiff(active$record_uid, known)
   if (length(unknown)) {
     warning(
       "Ignoring lookup rows for filenames not present in the analyzed result: ",
@@ -2197,7 +2163,7 @@ update_with_lookup <- function(
     )
   }
 
-  target <- intersect(active$filename, known)
+  target <- intersect(active$record_uid, known)
   if (!length(target)) {
     message("No lookup rows correspond to files in this result; nothing to update.")
     return(result)
@@ -2209,9 +2175,9 @@ update_with_lookup <- function(
   )
 
   tasks <- setNames(
-    lapply(target, function(f) list(
-      data   = result$raw[filename == f],
-      lookup = active[filename == f][1L]
+    lapply(target, function(id) list(
+      data   = result$raw[record_uid == id],
+      lookup = active[record_uid == id][1L]
     )),
     target
   )
@@ -2234,14 +2200,14 @@ update_with_lookup <- function(
   )
   names(updated) <- target
 
-  for (f in target) {
-    result$results[[f]] <- updated[[f]]
+  for (id in target) {
+    result$results[[id]] <- updated[[id]]
   }
 
   if (isTRUE(save_qc)) {
     qc_dir <- file.path(path, qc_subdir)
-    for (f in target) {
-      save_peak_qc(result$results[[f]], qc_dir = qc_dir)
+    for (id in target) {
+      save_peak_qc(result$results[[id]], qc_dir = qc_dir)
     }
   }
 
@@ -2275,21 +2241,21 @@ inspect_chrom_folder <- function(
     reader_args     = list()
   ) {
 
-  assert_peak_engines()
-
   path  <- normalizePath(path, winslash = "/", mustWork = TRUE)
   raw   <- do.call(read_chrom_folder, c(list(path), reader_args))
-  files <- unique(raw$filename)
-
+  
+  record_ids  <- unique(raw$record_uid)
   inspect_dir <- file.path(path, inspect_subdir)
   dir.create(inspect_dir, recursive = TRUE, showWarnings = FALSE)
 
-  for (i in seq_along(files)) {
-    f <- files[i]
-    message("Plotting chromatogram ", i, " / ", length(files), ": ", f)
+  for (i in seq_along(record_ids)) {
+    id <- record_ids[i]
+    dd <- raw[record_uid == id]
+    
+    message("Plotting chromatogram ", i, " / ", length(record_ids), ": ", dd$filename[1L])
 
     proc <- preprocess_chromatogram(
-      d               = raw[filename == f],
+      d               = dd,
       baseline_method = baseline_method,
       flatfit_args    = flatfit_args,
       mile_args       = mile_args
@@ -2297,7 +2263,12 @@ inspect_chrom_folder <- function(
 
     p <- ggplot(proc, aes(time_min, intensity)) +
       geom_line(linewidth = 0.35) +
-      geom_line(aes(y = baseline), linewidth = 0.3, linetype = 2, color = "deepskyblue") +
+      geom_line(
+        aes(y = baseline),
+        linewidth = 0.3,
+        linetype  = 2,
+        color     = "deepskyblue"
+      ) +
       labs(
         title    = proc$filename[1L],
         subtitle = paste0(
@@ -2312,7 +2283,17 @@ inspect_chrom_folder <- function(
       theme_bw() +
       theme(panel.grid.minor = element_blank())
 
-    stem <- tools::file_path_sans_ext(f)
+    stem <- tools::file_path_sans_ext(dd$filename[1L])
+    wl   <- dd$wavelength_nm[1L]
+    if (is.finite(wl)) {
+      stem <- paste0(
+        stem,
+        "_",
+        format(wl, trim = TRUE, scientific = FALSE),
+        "nm"
+      )
+    }
+    
     ggsave(
       file.path(inspect_dir, paste0(stem, "_plot.png")),
       plot   = p,
@@ -2349,7 +2330,9 @@ append_retention_database <- function(
 
   db[, duplicate := .N > 1L, by = duplicate_key]
 
-  if ("file_hash" %in% names(db)) {
+  if (all(c("file_hash", "wavelength_nm") %in% names(db))) {
+    db[, exact_file_duplicate := .N > 1L, by = .(file_hash, wavelength_nm)]
+  } else if ("file_hash" %in% names(db)) {
     db[, exact_file_duplicate := .N > 1L, by = file_hash]
   } else {
     db[, exact_file_duplicate := NA]
