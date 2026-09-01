@@ -102,9 +102,9 @@ find_chrom_files <- function(
   if (!is.null(extensions)) reg <- reg[ext %in% tolower(extensions)]
 
   ## --- directory-based formats (.D, Waters .raw) -----------------------------
-  dir_ext <- reg[container == "dir", ext]
-  dirs <- list.dirs(path, recursive = recursive, full.names = TRUE)
-  dirs <- setdiff(dirs, path)
+  dir_ext  <- reg[container == "dir", ext]
+  dirs     <- list.dirs(path, recursive = recursive, full.names = TRUE)
+  dirs     <- setdiff(dirs, path)
   dir_hits <- data.table::data.table()
   if (length(dirs) && length(dir_ext)) {
     de <- tolower(tools::file_ext(dirs))
@@ -264,10 +264,10 @@ read_text_chrom <- function(path, wavelength = NULL) {
 
   if (ncol(d) == 2L) {
     icol <- 2L
-    wl <- NA_real_
+    wl   <- NA_real_
   } else {
     ## multi-wavelength export: choose by header value
-    hv <- suppressWarnings(as.numeric(gsub("[^0-9.]", "", names(d))))
+    hv   <- suppressWarnings(as.numeric(gsub("[^0-9.]", "", names(d))))
     cand <- setdiff(seq_len(ncol(d)), tcol)
     if (!is.null(wavelength) && any(is.finite(hv[cand]))) {
       icol <- cand[which.min(abs(hv[cand] - wavelength))]
@@ -288,54 +288,239 @@ read_text_chrom <- function(path, wavelength = NULL) {
 }
 
 # ---------- chromConverter dispatch -------------------------------------------
+## Helper for Agilent DAD extraction.
+.extract_agilent_dad_wavelength <- function(x) {
+  dr <- attr(x, "detector_range", exact = TRUE)
+  if (is.null(dr) || !length(dr)) return(NA_real_)
+  dr <- as.character(dr)[1L]
+  
+  ## Example:
+  ## "DAD1A, Sig=225,4  Ref=off"
+  mm <- regmatches(
+    dr,
+    regexec("(?i)\\bSig\\s*=\\s*([0-9]+(?:\\.[0-9]+)?)", dr, perl = TRUE)
+  )[[1]]
+  
+  if (length(mm) < 2L) return(NA_real_)
+  
+  suppressWarnings(as.numeric(mm[2L]))
+}
 
 #' Read one vendor file via chromConverter and reduce it to two columns.
-read_vendor_chrom <- function(path, format_in, wavelength = NULL,
-                              read_metadata = TRUE, ...) {
-  if (!.cc_available()) {
-    stop("Reading '", format_in, "' needs the chromConverter package:\n",
-         "  install.packages('chromConverter')   # or pak::pak('ethanbass/chromConverter')")
-  }
-
-  res <- chromConverter::read_chroms(
-    paths         = path,
-    format_in     = format_in,
-    find_files    = FALSE,
-    format_out    = "data.table",
-    data_format   = "wide",
-    read_metadata = read_metadata,
-    progress_bar  = FALSE,
+read_vendor_chrom <- function(
+    path,
+    format_in,
+    wavelength    = NULL,
+    read_metadata = TRUE,
     ...
+) {
+  
+  if (!.cc_available()) {
+    stop(
+      "Reading '", format_in, "' needs the chromConverter package:\n",
+      "  install.packages('chromConverter')   # or pak::pak('ethanbass/chromConverter')"
+    )
+  }
+  
+  dots <- list(...)
+  res <- do.call(
+    chromConverter::read_chroms,
+    c(
+      list(
+        paths         = path,
+        format_in     = format_in,
+        find_files    = FALSE,
+        format_out    = "data.table",
+        data_format   = "wide",
+        read_metadata = read_metadata,
+        progress_bar  = FALSE
+      ),
+      dots
+    )
   )
-
-  x <- if (is.list(res) && !data.table::is.data.table(res)) res[[1L]] else res
+  
+  ## -----------------------------------------------------------------------
+  ## Agilent .D
+  ##
+  ## chromConverter returns approximately:
+  ##
+  ## res[[1]]$dad
+  ## res[[1]]$chroms$DAD1A
+  ## res[[1]]$chroms$DAD1B
+  ## -----------------------------------------------------------------------
+  
+  if (identical(tolower(format_in), "agilent_d")) {
+    if (!is.list(res) || !length(res) ||
+        !is.list(res[[1L]]) ||
+        is.null(res[[1L]]$chroms) ||
+        !length(res[[1L]]$chroms)) {
+      
+      stop(
+        "No chromatogram channels were found in Agilent .D folder: ",
+        basename(path)
+      )
+    }
+    
+    chroms        <- res[[1L]]$chroms
+    channel_names <- names(chroms)
+    
+    if (is.null(channel_names)) {
+      channel_names <- paste0("channel", seq_along(chroms))
+    }
+    
+    pieces <- vector("list", length(chroms))
+    
+    for (j in seq_along(chroms)) {
+      z  <- chroms[[j]]
+      wl <- .extract_agilent_dad_wavelength(z)
+      
+      ## chroms may theoretically contain non-DAD channels.
+      ## Only channels with a recoverable DAD signal wavelength are relevant
+      ## to this UV/DAD workflow.
+      if (!is.finite(wl)) {
+        next
+      }
+      
+      zz <- data.table::as.data.table(z)
+      
+      if (all(c("rt", "intensity") %in% names(zz))) {
+        tt <- suppressWarnings(as.numeric(zz$rt))
+        yy <- suppressWarnings(as.numeric(zz$intensity))
+      } else if (ncol(zz) == 2L) {
+        ## Defensive fallback in case chromConverter changes only the names.
+        tt <- suppressWarnings(as.numeric(zz[[1L]]))
+        yy <- suppressWarnings(as.numeric(zz[[2L]]))
+      } else {
+        stop(
+          "Unexpected structure for Agilent channel '",
+          channel_names[j],
+          "' in ",
+          basename(path),
+          ". Expected rt/intensity columns."
+        )
+      }
+      
+      dr <- attr(z, "detector_range", exact = TRUE)
+      
+      pieces[[j]] <- data.table::data.table(
+        time_min         = tt,
+        intensity        = yy,
+        wavelength_nm    = as.integer(round(wl)),
+        detector_channel = channel_names[j],
+        detector_range   = if (length(dr)) {
+          as.character(dr)[1L]
+        } else {
+          NA_character_
+        }
+      )
+    }
+    
+    pieces <- pieces[
+      !vapply(
+        pieces,
+        is.null,
+        logical(1)
+      )
+    ]
+    
+    if (!length(pieces)) {
+      stop(
+        "No DAD wavelength channels with a readable detector_range were found in: ",
+        basename(path)
+      )
+    }
+    
+    out <- data.table::rbindlist(
+      pieces,
+      use.names = TRUE,
+      fill      = TRUE
+    )
+    
+    ## Two separately exported channels at exactly the same wavelength would
+    ## otherwise receive the same logical record_uid downstream.
+    channel_map   <- unique(out[, .(detector_channel, wavelength_nm)])
+    duplicated_wl <- channel_map[, .N, by = wavelength_nm][N > 1L]
+    
+    if (nrow(duplicated_wl)) {
+      stop(
+        "Agilent .D contains multiple exported DAD channels at the same ",
+        "wavelength: ",
+        paste(
+          duplicated_wl$wavelength_nm,
+          collapse = ", "
+        ),
+        " nm. These cannot be represented uniquely by wavelength alone."
+      )
+    }
+    
+    out <- out[is.finite(time_min) & is.finite(intensity)]
+    
+    data.table::setorder(out, wavelength_nm, time_min)
+    data.table::setattr(out, "n_channels", uniqueN(out$wavelength_nm))
+    
+    return(out[])
+  }
+  
+  
+  ## -----------------------------------------------------------------------
+  ## Other chromConverter formats: retain the existing single-trace logic
+  ## -----------------------------------------------------------------------
+  
+  x <- if (is.list(res) && !data.table::is.data.table(res)) {
+    res[[1L]]
+  } else {
+    res
+  }
+  
   meta <- attributes(x)
-  m <- as.matrix(x)
-
-  ## wide format is retention time x wavelength; the time axis lives in the
-  ## row names for matrix output and may be the first column for data.table
+  m    <- as.matrix(x)
+  
   rn <- suppressWarnings(as.numeric(rownames(x)))
+  
   if (all(is.finite(rn)) && length(rn) == nrow(m)) {
-    tt <- rn
+    tt   <- rn
     vals <- m
   } else {
-    tt <- suppressWarnings(as.numeric(m[, 1L]))
+    tt   <- suppressWarnings(as.numeric(m[, 1L]))
     vals <- m[, -1L, drop = FALSE]
   }
-
+  
   hv <- suppressWarnings(as.numeric(gsub("[^0-9.]", "", colnames(vals))))
+  
   j <- if (!is.null(wavelength) && any(is.finite(hv))) {
     which.min(abs(hv - wavelength))
-  } else 1L
-
+  } else {
+    1L
+  }
+  
   out <- data.table::data.table(
     time_min  = as.numeric(tt),
     intensity = as.numeric(vals[, j])
   )
-  data.table::setattr(out, "vendor_metadata", meta[setdiff(names(meta), c("dim", "dimnames", "class", "names", "row.names"))])
-  data.table::setattr(out, "wavelength_from_header", hv[j])
-  data.table::setattr(out, "n_channels", ncol(vals))
-  out
+  
+  data.table::setattr(
+    out,
+    "vendor_metadata",
+    meta[setdiff(names(meta), c("dim",
+                                "dimnames",
+                                "class",
+                                "names",
+                                "row.names"))]
+  )
+  
+  data.table::setattr(
+    out,
+    "wavelength_from_header",
+    if (length(hv) >= j) hv[j] else NA_real_
+  )
+  
+  data.table::setattr(
+    out,
+    "n_channels",
+    ncol(vals)
+  )
+  
+  out[]
 }
 
 #' Read one chromatogram of any supported type.
@@ -349,8 +534,8 @@ read_chrom_file <- function(
   ) {
   time_unit <- match.arg(time_unit)
   this_ext  <- tolower(tools::file_ext(path))
-  reg <- CHROM_FORMATS[ext == this_ext]
-  if (is.null(engine))    engine    <- if (nrow(reg)) reg$engine[1L] else "text"
+  reg       <- CHROM_FORMATS[ext == this_ext]
+  if (is.null(engine))    engine    <- if (nrow(reg)) reg$engine[1L]    else "text"
   if (is.null(format_in)) format_in <- if (nrow(reg)) reg$format_in[1L] else NA_character_
 
   d <- if (identical(engine, "text") || this_ext %in% CHROM_TEXT_EXT) {
@@ -358,9 +543,12 @@ read_chrom_file <- function(
   } else {
     read_vendor_chrom(path, format_in = format_in, wavelength = wavelength, ...)
   }
-
   d <- d[is.finite(time_min) & is.finite(intensity)]
-  data.table::setorder(d, time_min)
+  if ("channel_wavelength_nm" %in% names(d)) {
+    data.table::setorder(d, channel_wavelength_nm, time_min)
+  } else {
+    data.table::setorder(d, time_min)
+  }
   if (nrow(d) < 5L) stop("Fewer than five usable data points in: ", basename(path))
 
   ## Seconds vs minutes: a chromatogram that "runs" for hundreds of units with
@@ -418,15 +606,117 @@ arw_metadata_parser <- function(path, first_lines = NULL, ext_re = "arw|arq") {
   )
 }
 
+.parse_encoded_metadata <- function(text, experimentalID = NULL) {
+  
+  text <- trimws(as.character(text)[1L])
+  if (!nzchar(text)) {
+    return(NULL)
+  }
+  
+  original <- text
+  
+  ## Optional trailing wavelength:
+  ## compound_column_eluent_modifier_temp_flow_210nm
+  wl <- NA_integer_
+  
+  wm <- regmatches(
+    text,
+    regexec(
+      "_(\\d{3})\\s*nm$",
+      text,
+      ignore.case = TRUE,
+      perl        = TRUE
+    )
+  )[[1]]
+  
+  if (length(wm)) {
+    wl <- as.integer(wm[2L])
+    text <- sub(
+      "_\\d{3}\\s*nm$",
+      "",
+      text,
+      ignore.case = TRUE,
+      perl = TRUE
+    )
+  }
+  
+  mm <- regmatches(
+    text,
+    regexec(
+      paste0(
+        "^(.+)_",                        # compound
+        "([^_]+)_",                      # column
+        "([^_]+)_",                      # eluent
+        "([^_]+)_",                      # modifier
+        "(-?[0-9]+(?:\\.[0-9]+)?)_",     # temperature
+        "([0-9]+(?:\\.[0-9]+)?)$"        # 10 x flow
+      ),
+      text,
+      perl = TRUE
+    )
+  )[[1]]
+  
+  if (!length(mm)) {
+    return(NULL)
+  }
+  
+  if (is.null(experimentalID)) {
+    ## Deliberately excludes an optional "_210nm" suffix so separate
+    ## wavelength files remain part of the same experiment.
+    experimentalID <- text
+  }
+  
+  list(
+    wavelength_nm  = wl,
+    experimentalID = experimentalID,
+    compoundname   = mm[2L],
+    columnID       = mm[3L],
+    eluentID       = mm[4L],
+    modifierID     = mm[5L],
+    temp_C         = as.numeric(mm[6L]),
+    flow_mL_min    = as.numeric(mm[7L]) / 10,
+    metadata_raw   = original
+  )
+}
+
+filename_metadata_parser <- function(path, first_lines = NULL) {
+  stem <- tools::file_path_sans_ext(basename(path))
+  .parse_encoded_metadata(stem)
+}
+
 #' Last-resort parser: take the stem as the experiment id and a trailing
 #' 3-digit "###nm" as the wavelength if present. Never fails.
 generic_metadata_parser <- function(path, first_lines = NULL) {
   stem <- tools::file_path_sans_ext(basename(path))
-  wl <- suppressWarnings(as.integer(
-    sub(".*?(\\d{3})\\s*nm.*", "\\1", stem, ignore.case = TRUE)))
+  
+  wm <- regmatches(
+    stem,
+    regexec(
+      "_?(\\d{3})\\s*nm$",
+      stem,
+      ignore.case = TRUE,
+      perl = TRUE
+    )
+  )[[1]]
+  
+  if (length(wm)) {
+    wl <- suppressWarnings(as.integer(wm[2L]))
+    
+    experimentalID <- sub(
+      "_?\\d{3}\\s*nm$",
+      "",
+      stem,
+      ignore.case = TRUE,
+      perl = TRUE
+    )
+  } else {
+    wl             <- NA_integer_
+    experimentalID <- stem
+  }
+  
   list(
-    wavelength_nm  = if (is.finite(wl) && grepl("\\d{3}\\s*nm", stem, ignore.case = TRUE)) wl else NA_integer_,
-    experimentalID = stem,
+    wavelength_nm  = wl,
+    experimentalID = experimentalID,
     compoundname   = NA_character_,
     columnID       = NA_character_,
     eluentID       = NA_character_,
@@ -437,7 +727,190 @@ generic_metadata_parser <- function(path, first_lines = NULL) {
   )
 }
 
+.read_agilent_sample_name <- function(path) {
+  f <- list.files(
+    path,
+    pattern     = "^SAMPLE\\.XML$",
+    ignore.case = TRUE,
+    full.names  = TRUE
+  )
+  
+  if (!length(f)) return(NA_character_)
+  f <- f[1L]
+  
+  ## Preferred robust XML parser
+  if (requireNamespace("xml2", quietly = TRUE)) {
+    val <- tryCatch({
+      doc  <- xml2::read_xml(f)
+      node <- xml2::xml_find_first(
+        doc,
+        "//*[local-name()='Sample']/*[local-name()='Name']"
+      )
+      xml2::xml_text(node)
+    }, error = function(e) NA_character_)
+    
+    val <- trimws(val)
+    
+    if (length(val) == 1L &&
+        !is.na(val) &&
+        nzchar(val)) {
+      return(val)
+    }
+  }
+  
+  ## Dependency-free fallback
+  txt <- tryCatch(
+    paste(readLines(f, warn = FALSE), collapse = "\n"),
+    error = function(e) ""
+  )
+  if (!nzchar(txt)) return(NA_character_)
+  
+  mm <- regmatches(
+    txt,
+    regexec(
+      paste0(
+        "(?is)",
+        "<Sample\\b[^>]*>.*?",
+        "<Name\\b[^>]*>\\s*([^<]+?)\\s*</Name>"
+      ),
+      txt,
+      perl = TRUE
+    )
+  )[[1]]
+  
+  if (length(mm) >= 2L) {
+    return(trimws(mm[2L]))
+  }
+  
+  NA_character_
+}
+
+agilent_d_metadata_parser <- function(path, first_lines = NULL) {
+  
+  if (!dir.exists(path) || tolower(tools::file_ext(path)) != "d") {
+    return(NULL)
+  }
+  
+  folder_stem <- tools::file_path_sans_ext(basename(path))
+  sample_name <- .read_agilent_sample_name(path)
+  
+  if (is.na(sample_name) || !nzchar(sample_name)) {
+    return(NULL)
+  }
+  
+  ## Metadata comes from SAMPLE.XML, but experimentalID remains the physical
+  ## .D acquisition name.
+  .parse_encoded_metadata(sample_name, experimentalID = folder_stem)
+}
+
 # ---------- Folder reader -----------------------------------------------------
+
+hash_chrom_entry <- function(
+    path,
+    container  = c("file", "dir"),
+    use_digest = TRUE
+) {
+  container <- match.arg(container)
+  
+  if (container == "file") {
+    
+    if (isTRUE(use_digest) && requireNamespace("digest", quietly = TRUE)) {
+      
+      return(
+        digest::digest(
+          path,
+          algo = "xxhash64",
+          file = TRUE
+        )
+      )
+    }
+    
+    fi <- file.info(path)
+    
+    return(
+      substr(
+        digest_fallback(
+          paste(basename(path), fi$size, as.numeric(fi$mtime), sep = "|")
+        ),
+        1L,
+        16L
+      )
+    )
+  }
+  
+  ## Directory-based formats such as Agilent .D.
+  ##
+  ## Do not hash every byte. Hash a deterministic manifest consisting of
+  ## relative filename + file size + modification time.
+  ff <- list.files(
+    path,
+    recursive  = TRUE,
+    full.names = TRUE,
+    all.files  = TRUE,
+    no..       = TRUE
+  )
+  
+  ff <- ff[!dir.exists(ff)]
+  
+  if (!length(ff)) {
+    txt <- paste0(
+      basename(path),
+      "|empty"
+    )
+  } else {
+    root <- normalizePath(
+      path,
+      winslash = "/",
+      mustWork = TRUE
+    )
+    
+    ffn <- normalizePath(
+      ff,
+      winslash = "/",
+      mustWork = TRUE
+    )
+    
+    rel <- substring(
+      ffn,
+      nchar(root) + 2L
+    )
+    
+    fi <- file.info(ffn)
+    
+    manifest <- data.table::data.table(
+      relative_path = rel,
+      size          = fi$size,
+      mtime         = as.numeric(fi$mtime)
+    )
+    
+    data.table::setorder(
+      manifest,
+      relative_path
+    )
+    
+    txt <- paste(
+      manifest$relative_path,
+      manifest$size,
+      sprintf("%.0f", manifest$mtime),
+      sep      = ":",
+      collapse = "|"
+    )
+  }
+  
+  if (isTRUE(use_digest) && requireNamespace("digest", quietly = TRUE)) {
+    digest::digest(
+      txt,
+      algo      = "xxhash64",
+      serialize = FALSE
+    )
+  } else {
+    substr(
+      digest_fallback(txt),
+      1L,
+      16L
+    )
+  }
+}
 
 #' Read every chromatogram in a folder, whatever the format.
 #'
@@ -455,7 +928,10 @@ read_chrom_folder <- function(
     recursive           = FALSE,
     wavelength          = NULL,
     time_unit           = c("min", "s", "auto"),
-    metadata_parsers    = list(arw_metadata_parser, generic_metadata_parser),
+    metadata_parsers    = list(arw_metadata_parser,
+                               filename_metadata_parser,
+                               agilent_d_metadata_parser,
+                               generic_metadata_parser),
     require_date_folder = TRUE,
     on_error            = c("stop", "skip"),
     hash_files          = TRUE,
@@ -465,7 +941,7 @@ read_chrom_folder <- function(
   time_unit <- match.arg(time_unit)
   on_error  <- match.arg(on_error)
 
-  path <- normalizePath(path, winslash = "/", mustWork = TRUE)
+  path        <- normalizePath(path, winslash = "/", mustWork = TRUE)
   folder_name <- basename(path)
 
   fm <- regmatches(folder_name,
@@ -474,8 +950,7 @@ read_chrom_folder <- function(
     date <- as.Date(fm[2L], format = "%Y%m%d")
     folder_label <- if (length(fm) >= 3L && !is.na(fm[3L])) fm[3L] else ""
   } else if (require_date_folder) {
-    stop("Folder name must begin with YYYYMMDD, optionally followed by _junk: ",
-         folder_name)
+    stop("Folder name must begin with YYYYMMDD, optionally followed by _junk: ", folder_name)
   } else {
     date <- as.Date(file.info(path)$mtime)
     folder_label <- folder_name
@@ -500,11 +975,17 @@ read_chrom_folder <- function(
   failures <- list()
 
   read_one <- function(k) {
-    p <- cand$path[k]
+    p        <- cand$path[k]
     filename <- cand$name[k]
 
-    d <- read_chrom_file(p, format_in = cand$format_in[k], engine = cand$engine[k],
-                         wavelength = wavelength, time_unit = time_unit, ...)
+    d <- read_chrom_file(
+      p,
+      format_in  = cand$format_in[k],
+      engine     = cand$engine[k],
+      wavelength = wavelength,
+      time_unit  = time_unit,
+      ...
+    )
 
     first_lines <- if (cand$engine[k] == "text") {
       tryCatch(readLines(p, n = 3L, warn = FALSE), error = function(e) NULL)
@@ -517,29 +998,67 @@ read_chrom_folder <- function(
     }
     if (is.null(md)) md <- generic_metadata_parser(p, first_lines)
 
-    ## a wavelength recovered from the file itself beats one guessed from the name
-    wl_hdr <- attr(d, "wavelength_from_header")
-    if ((is.null(md$wavelength_nm) || !is.finite(md$wavelength_nm)) &&
-        is.finite(wl_hdr)) md$wavelength_nm <- as.integer(round(wl_hdr))
-    if (is.null(md$wavelength_nm) || !is.finite(md$wavelength_nm)) {
-      md$wavelength_nm <- NA_integer_
-    }
-
-    file_hash <- if (isTRUE(hash_files) && requireNamespace("digest", quietly = TRUE) &&
-                     cand$container[k] == "file") {
-      digest::digest(p, algo = "xxhash64", file = TRUE)
+    ## -------------------------------------------------------------------------
+    ## Resolve wavelength.
+    ##
+    ## Multi-channel vendor containers such as Agilent .D already carry
+    ## wavelength_nm as a column. Otherwise recover it from the trace itself
+    ## or finally from parsed metadata.
+    ## -------------------------------------------------------------------------
+    
+    if ("wavelength_nm" %in% names(d)) {
+      d[, wavelength_nm := as.integer(round(as.numeric(wavelength_nm)))]
     } else {
-      fi <- file.info(p)
-      substr(digest_fallback(paste(filename, fi$size, fi$mtime)), 1L, 16L)
+      wl_hdr <- attr(d, "wavelength_from_header")
+      wl     <- NA_real_
+      
+      if (length(wl_hdr) && is.finite(wl_hdr)) {
+        wl <- as.numeric(wl_hdr)[1L]
+      } else if (!is.null(md$wavelength_nm) &&
+                 length(md$wavelength_nm) &&
+                 is.finite(md$wavelength_nm)) {
+        wl <- as.numeric(md$wavelength_nm)[1L]
+      }
+      
+      d[, wavelength_nm :=
+          if (is.finite(wl)) {
+            as.integer(round(wl))
+          } else {
+            NA_integer_
+          }]
     }
-
-    logical_key <- paste(format(date, "%Y%m%d"),
-                         md$experimentalID, md$wavelength_nm, sep = "__")
-    record_uid <- paste0(logical_key, "__", substr(file_hash, 1L, 12L))
-
+    
+    ## One physical .D folder may contain several logical chromatograms.
+    n_channels_this <- if (any(is.finite(d$wavelength_nm))) {
+      uniqueN(d[is.finite(wavelength_nm), wavelength_nm])
+    } else {
+      attr(d, "n_channels")
+    }
+    
+    ## Physical-source fingerprint: shared by all channels from the same .D.
+    file_hash <- hash_chrom_entry(
+      p,
+      container  = cand$container[k],
+      use_digest = hash_files
+    )
+    
+    ## Logical chromatographic identity differs by wavelength.
+    d[, logical_key :=
+        paste(
+          format(date, "%Y%m%d"),
+          md$experimentalID,
+          wavelength_nm,
+          sep = "__"
+        )]
+    
+    d[, record_uid :=
+        paste0(
+          logical_key,
+          "__",
+          substr(file_hash, 1L, 12L)
+        )]
+    
     d[, `:=`(
-      record_uid     = record_uid,
-      logical_key    = logical_key,
       date           = date,
       folder_label   = folder_label,
       source_folder  = path,
@@ -547,8 +1066,7 @@ read_chrom_folder <- function(
       file_hash      = file_hash,
       extension      = cand$ext[k],
       source_format  = cand$format_in[k],
-      n_channels     = attr(d, "n_channels"),
-      wavelength_nm  = md$wavelength_nm,
+      n_channels     = n_channels_this,
       experimentalID = md$experimentalID,
       compoundname   = md$compoundname,
       columnID       = md$columnID,
@@ -558,6 +1076,9 @@ read_chrom_folder <- function(
       flow_mL_min    = md$flow_mL_min,
       metadata_raw   = md$metadata_raw
     )]
+    if ("channel_wavelength_nm" %in% names(d)) {
+      d[, channel_wavelength_nm := NULL]
+    }
 
     first_cols <- c("record_uid",    "logical_key",  "date",           "folder_label",
                     "filename",      "file_hash",    "wavelength_nm",  "experimentalID",
