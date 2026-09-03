@@ -1215,7 +1215,7 @@ analyze_one_chromatogram <- function(
       mile_hw            = proc$mile_hw[1L],
       mile_smooth_hw     = proc$mile_smooth_hw[1L],
       mile_mollify_hw    = proc$mile_mollify_hw[1L],
-      mile_iterations    = proc$mile_iterations[1L],
+      mile_iterations    = proc$mile_iterations[1L]
     )
   }
 
