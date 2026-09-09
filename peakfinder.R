@@ -15,7 +15,7 @@ suppressWarnings(
   })
 )
 
-PEAKFINDER_VERSION <- "0.4.0"
+PEAKFINDER_VERSION <- "0.5.0"
 
 # ---------- Lookup ------------------------------------------------------------
 
@@ -56,7 +56,12 @@ write_peak_lookup_template <- function(
     filename,
     wavelength_nm,
     experimentalID,
-    compoundname
+    compoundname,
+    columnID,
+    eluentID,
+    modifierID,
+    temp_C,
+    flow_mL_min
   )]
   
   setorder(
@@ -1877,59 +1882,59 @@ assemble_analysis_result <- function(
 
 # ---------- Parallel helper ---------------------------------------------------
 
-.parallel_lapply <- function(
-    X,
-    FUN,
-    n_workers = 1L,
-    seed      = 1L,
-    progress  = TRUE
-  ) {
-
+.parallel_lapply <- function(X, FUN, n_workers = 1L, seed = 1L, progress = TRUE,
+                             chunk_size = NULL) {
+  
   n_workers <- as.integer(n_workers)
   if (!is.finite(n_workers) || n_workers < 1L) n_workers <- 1L
-
   n <- length(X)
   if (!n) return(vector("list", 0L))
-
-  ## Sequential mode gets a dependency-free base-R progress bar.
+  
   if (n_workers == 1L || n <= 1L) {
     if (!is.null(seed)) set.seed(seed)
-    out <- vector("list", n)
-    names(out) <- names(X)
-
+    out <- vector("list", n); names(out) <- names(X)
     pb <- NULL
     if (isTRUE(progress) && interactive()) {
       pb <- utils::txtProgressBar(min = 0, max = n, style = 3)
       on.exit(if (!is.null(pb)) close(pb), add = TRUE)
     }
-
     for (i in seq_len(n)) {
       out[[i]] <- FUN(X[[i]])
+      X[i] <- list(NULL)                       # release each task as we go
       if (!is.null(pb)) utils::setTxtProgressBar(pb, i)
     }
     return(out)
   }
-
+  
   if (!requireNamespace("future", quietly = TRUE) ||
       !requireNamespace("future.apply", quietly = TRUE)) {
-    warning(
-      "n_workers > 1 requested, but packages 'future' and 'future.apply' are ",
-      "not installed. Falling back to sequential analysis."
-    )
-    return(.parallel_lapply(X, FUN, n_workers = 1L, seed = seed, progress = progress))
+    warning("n_workers > 1 requested but 'future'/'future.apply' are missing; ",
+            "running sequentially.")
+    return(.parallel_lapply(X, FUN, 1L, seed, progress))
   }
-
+  
+  ## Guard rail: report what is actually about to be shipped, and refuse to
+  ## silently ship a dataset.
+  fun_mb <- length(serialize(FUN, NULL)) / 1024^2
+  if (fun_mb > 50) {
+    warning(sprintf(
+      "The worker function serialises to %.0f MB. It is almost certainly\n",
+      fun_mb),
+      "capturing a large object through its enclosing environment. Build it ",
+      "with a TOP-LEVEL factory (see .pf_make_analysis_worker) so its ",
+      "environment chain terminates at globalenv.", call. = FALSE)
+  }
+  
   old_plan <- future::plan()
   on.exit(future::plan(old_plan), add = TRUE)
-
+  
   max_workers <- suppressWarnings(parallel::detectCores(logical = TRUE)) - 1L
   if (!is.finite(max_workers) || max_workers < 1L) max_workers <- 1L
   n_workers <- max(1L, min(n_workers, max_workers, n))
-
   future::plan(future::multisession, workers = n_workers)
   if (!is.null(seed)) set.seed(seed)
-
-  run_future <- function(progressor = NULL) {
+  
+  run <- function(progressor = NULL) {
     future.apply::future_lapply(
       X,
       function(z) {
@@ -1938,33 +1943,25 @@ assemble_analysis_result <- function(
         if (!is.null(progressor)) progressor()
         ans
       },
-      future.seed     = TRUE,
-      future.packages = c("data.table", "stringr")
+      future.seed       = TRUE,
+      ## Only load what the workers actually need. Every extra package is a
+      ## namespace load in each of n_workers fresh R sessions.
+      future.packages   = intersect(c("data.table", "stringr"),
+                                    rownames(utils::installed.packages())),
+      future.scheduling = if (is.null(chunk_size)) 1.0 else structure(TRUE, chunk.size = chunk_size)
     )
   }
-
-  ## progressr relays progress conditions from multisession workers back to the
-  ## main R process. Without it, future_lapply has no reliable completion-order
-  ## progress signal, so analysis still runs but without a live bar.
+  
   if (isTRUE(progress) && requireNamespace("progressr", quietly = TRUE)) {
-    old_progress_opt <- getOption("progressr.enable")
-    on.exit(options(progressr.enable = old_progress_opt), add = TRUE)
+    old <- getOption("progressr.enable")
+    on.exit(options(progressr.enable = old), add = TRUE)
     options(progressr.enable = TRUE)
-
     out <- progressr::with_progress({
-      p <- progressr::progressor(steps = n)
-      run_future(progressor = p)
+      p <- progressr::progressor(steps = n); run(progressor = p)
     })
   } else {
-    if (isTRUE(progress) && !requireNamespace("progressr", quietly = TRUE)) {
-      message(
-        "Parallel analysis is running without a live progress bar. Install ",
-        "'progressr' to enable one: install.packages('progressr')."
-      )
-    }
-    out <- run_future()
+    out <- run()
   }
-
   names(out) <- names(X)
   out
 }
@@ -2001,7 +1998,6 @@ analyze_chrom_folder <- function(
     deconv_require_same_count          = TRUE,
     lookup_filename                    = "peakfinder_lookup.csv",
     create_lookup_template             = TRUE,
-    lookup_template_max_peaks          = 6L,
     overwrite_lookup_template          = FALSE,
     save_qc                            = TRUE,
     qc_subdir                          = "peakfinder_QC",
@@ -2031,7 +2027,7 @@ analyze_chrom_folder <- function(
       raw,
       path      = path,
       filename  = lookup_filename,
-      max_peaks = lookup_template_max_peaks,
+      max_peaks = max_peaks,
       overwrite = overwrite_lookup_template
     )
   }
@@ -2227,6 +2223,292 @@ update_with_lookup <- function(
   out
 }
 
+# ---------- Memory-efficient batched processing ------------------------------
+
+.pf_make_analysis_worker <- function(
+    settings,
+    keep_traces = FALSE,
+    qc_dir      = NULL
+) {
+  force(settings); force(keep_traces); force(qc_dir)
+  function(task) {
+    d <- .pf_task_to_dt(task)
+    r <- do.call(analyze_one_chromatogram,
+                 c(list(d = d, lookup = NULL), settings))
+    ## Render QC inside the worker so the trace never travels back, and only
+    ## the file path does.
+    if (!is.null(qc_dir)) {
+      p <- try(save_peak_qc(r, qc_dir = qc_dir), silent = TRUE)
+      r$qc_path <- if (inherits(p, "try-error")) NA_character_ else p
+    }
+    if (!isTRUE(keep_traces)) r$processed_trace <- NULL
+    r
+  }
+}
+
+## Rebuild the full-schema data.table one record at a time, inside the worker.
+## Cheap (one record is 3.7 MB transiently) and lets analyze_one_chromatogram()
+## stay exactly as it is.
+.pf_task_to_dt <- function(task) {
+  d <- data.table::copy(task$trace)
+  m <- task$meta
+  for (cn in names(m)) data.table::set(d, j = cn, value = m[[cn]][1L])
+  d[]
+}
+
+# Compact task construction
+
+#' Compact a raw table in place: one trace table plus one metadata row per
+#' record. Call this immediately after reading and drop the fat table -- it is
+#' an 8x reduction (6.1 GB -> 0.8 GB at 1700 x 24001 points) and it is what
+#' bounds the resident set for the rest of the run.
+pf_compact_raw <- function(raw) {
+  data_cols <- intersect(c("time_min", "intensity"), names(raw))
+  meta_cols <- setdiff(names(raw), data_cols)
+  meta      <- unique(raw[, ..meta_cols], by = "record_uid")
+  traces    <- raw[, c(list(rid = match(record_uid, meta$record_uid)),
+                       lapply(.SD, identity)), .SDcols = data_cols]
+  list(traces = traces, meta = meta)
+}
+
+#' Build compact tasks from the output of pf_compact_raw().
+pf_tasks_from_compact <- function(cmp, ids) {
+  j   <- match(ids, cmp$meta$record_uid)
+  idx <- split(seq_len(nrow(cmp$traces)), cmp$traces$rid)
+  lapply(seq_along(ids), function(k) {
+    i <- idx[[as.character(j[k])]]
+    list(trace = cmp$traces[i, .(time_min, intensity)],
+         meta  = cmp$meta[j[k]])
+  })
+}
+
+#' Split a raw table into per-record tasks that carry no replicated metadata.
+#'
+#' @return list of `list(trace = data.table(time_min, intensity), meta = 1 row)`
+pf_make_tasks <- function(raw, ids = NULL) {
+  stopifnot(data.table::is.data.table(raw))
+  if (is.null(ids)) ids <- unique(raw$record_uid)
+  data_cols <- intersect(c("time_min", "intensity"), names(raw))
+  if (length(data_cols) < 2L)
+    stop("raw must contain time_min and intensity")
+  meta_cols <- setdiff(names(raw), data_cols)
+  
+  idx <- split(seq_len(nrow(raw)), raw$record_uid)
+  idx <- idx[as.character(ids)]
+  
+  lapply(idx, function(i) {
+    list(trace = raw[i,     ..data_cols],
+         meta  = raw[i[1L], ..meta_cols])
+  })
+}
+
+#' Memory-bounded folder analysis.
+#'
+#' Reads once, then processes `chunk` records at a time. Peak memory is
+#' governed by the chunk, not by the number of files, so 1700 files costs the
+#' same as 200. Per-chunk outputs are reduced to the small tables immediately
+#' and the traces are released.
+#'
+#' @param chunk records per batch. 100-200 is a good default; smaller if the
+#'   traces are long.
+#' @param keep_raw keep the full raw table in the returned object. FALSE stores
+#'   only the metadata table, which is what the summaries actually use.
+#' @param ... passed to analyze_chrom_folder()'s settings.
+analyze_chrom_folder_chunked <- function(
+    path,
+    chunk                              = 150L,
+    keep_traces                        = FALSE,
+    keep_raw                           = FALSE,
+    
+    look_for_t0                        = TRUE,
+    t0_upper_limit                     = NULL,
+    t0_manual                          = NA_real_,
+    analyte_lower_limit                = NULL,
+    snr_min                            = 20,
+    relative_height_min                = 0.25,
+    fwer                               = 0.05,
+    min_prom                           = NULL,
+    nsim                               = 25L,
+    do_shoulders                       = FALSE,
+    min_peak_distance_min              = 0.05,
+    max_peaks                          = 6L,
+    manual_window_min                  = 0.10,
+    baseline_method                    = c("flatfit", "mile"),
+    flatfit_args                       = list(),
+    mile_args                          = list(),
+    mile_auto_mollify                  = TRUE,
+    mile_mollify_fraction              = 0.10,
+    mile_mollify_max_hw                = 15L,
+    mile_mollify_min_base_hw           = 8L,
+    deconvolve_clustered               = TRUE,
+    deconv_min_members                 = 2L,
+    deconv_pad                         = 1.5,
+    deconv_k_max                       = 4L,
+    deconv_min_snr                     = NULL,
+    deconv_require_same_count          = TRUE,
+    
+    lookup_filename                    = "peakfinder_lookup.csv",
+    create_lookup_template             = TRUE,
+    overwrite_lookup_template          = FALSE,
+    save_qc                            = TRUE,
+    qc_subdir                          = "peakfinder_QC",
+    cross_wavelength_tolerance_min     = 0.05,
+    snap_to_cross_wavelength_consensus = TRUE,
+    
+    n_workers                          = 1L,
+    seed                               = 1L,
+    progress                           = TRUE,
+    reader_args                        = list()
+) {
+  
+  path <- normalizePath(path, winslash = "/", mustWork = TRUE)
+  raw  <- do.call(read_chrom_folder, c(list(path), reader_args))
+  
+  record_map <- unique(raw[, .(record_uid, filename, wavelength_nm)])
+  bad_uid    <- record_map[, .N, by = record_uid][N > 1L]
+  if (nrow(bad_uid)) {
+    stop("A record_uid maps to more than one chromatographic record.")
+  }
+  
+  if (isTRUE(create_lookup_template)) {
+    write_peak_lookup_template(
+      raw,
+      path      = path,
+      filename  = lookup_filename,
+      max_peaks = max_peaks,
+      overwrite = overwrite_lookup_template
+    )
+  }
+  
+  ## Compact and release the fat table before any analysis starts. Chunking the
+  ## WORK without this leaves the metadata-replicated raw resident all run.
+  keep_raw_copy <- if (isTRUE(keep_raw)) raw else NULL
+  cmp <- pf_compact_raw(raw)
+  rm(raw); invisible(gc(FALSE))
+  
+  settings <- list(
+    look_for_t0               = look_for_t0,
+    t0_upper_limit            = t0_upper_limit,
+    t0_manual                 = t0_manual,
+    analyte_lower_limit       = analyte_lower_limit,
+    snr_min                   = snr_min,
+    relative_height_min       = relative_height_min,
+    fwer                      = fwer,
+    min_prom                  = min_prom,
+    nsim                      = nsim,
+    do_shoulders              = do_shoulders,
+    min_peak_distance_min     = min_peak_distance_min,
+    max_peaks                 = max_peaks,
+    manual_window_min         = manual_window_min,
+    baseline_method           = baseline_method,
+    flatfit_args              = flatfit_args,
+    mile_args                 = mile_args,
+    mile_auto_mollify         = mile_auto_mollify,
+    mile_mollify_fraction     = mile_mollify_fraction,
+    mile_mollify_max_hw       = mile_mollify_max_hw,
+    mile_mollify_min_base_hw  = mile_mollify_min_base_hw,
+    deconvolve_clustered      = deconvolve_clustered,
+    deconv_min_members        = deconv_min_members,
+    deconv_pad                = deconv_pad,
+    deconv_k_max              = deconv_k_max,
+    deconv_min_snr            = deconv_min_snr,
+    deconv_require_same_count = deconv_require_same_count
+  )
+  
+  ids <- cmp$meta$record_uid
+  n   <- length(ids)
+  
+  qc_dir <- if (isTRUE(save_qc)) file.path(path, qc_subdir) else NULL
+  if (!is.null(qc_dir)) dir.create(qc_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  worker <- .pf_make_analysis_worker(
+    settings,
+    keep_traces     = keep_traces,
+    qc_dir          = qc_dir
+  )
+  
+  ## Accumulate the per-record objects, not combined tables. Only
+  ## processed_trace is heavy; candidates / peaks / run / deconvolution are
+  ## small, so keeping them costs almost nothing and keeps the output identical.
+  results <- vector("list", n)
+  names(results) <- ids
+  
+  n_chunk <- ceiling(n / chunk)
+  for (b in seq_len(n_chunk)) {
+    from  <- (b - 1L) * chunk + 1L
+    to    <- min(from + chunk - 1L, n)
+    ids_b <- ids[from:to]
+    if (isTRUE(progress)) {
+      message(sprintf("chunk %d/%d: records %d-%d of %d", b, n_chunk, from, to, n))
+    }
+    
+    tasks <- pf_tasks_from_compact(cmp, ids_b)
+    res   <- .parallel_lapply(
+      tasks,
+      worker,
+      n_workers = n_workers,
+      seed      = seed,
+      progress  = progress
+    )
+    names(res)       <- ids_b
+    results[from:to] <- res
+    rm(tasks, res); invisible(gc(FALSE))
+  }
+  
+  out <- assemble_analysis_result(
+    raw                                = keep_raw_copy,
+    results                            = results,
+    path                               = path,
+    settings                           = settings,
+    lookup_filename                    = lookup_filename,
+    qc_subdir                          = qc_subdir,
+    save_qc                            = save_qc,
+    cross_wavelength_tolerance_min     = cross_wavelength_tolerance_min,
+    snap_to_cross_wavelength_consensus = snap_to_cross_wavelength_consensus
+  )
+  
+  ## Extra fields, added AFTER assemble so the base structure is untouched.
+  ## `compact` is what lets update_with_lookup() work without keep_raw = TRUE.
+  out$metadata <- cmp$meta
+  out$compact  <- if (isTRUE(keep_raw)) NULL else cmp
+  out
+}
+
+# ---------- Update that works with or without keep_raw -----------------------
+
+#' Rows of the original full-schema table for the given record ids, taken from
+#' `result$raw` if it was kept and rebuilt from `result$compact` if not.
+pf_result_raw <- function(result, ids = NULL) {
+  if (!is.null(result$raw)) {
+    return(if (is.null(ids)) result$raw else result$raw[record_uid %in% ids])
+  }
+  if (is.null(result$compact)) {
+    stop("result carries neither `raw` nor `compact`; re-run with keep_raw = TRUE.")
+  }
+  cmp <- result$compact
+  if (is.null(ids)) ids <- cmp$meta$record_uid
+  data.table::rbindlist(
+    lapply(pf_tasks_from_compact(cmp, ids), .pf_task_to_dt),
+    use.names = TRUE, fill = TRUE
+  )
+}
+
+#' update_with_lookup() for results produced by analyze_chrom_folder_chunked().
+#' Identical to the original except that it pulls records through
+#' pf_result_raw(), so it works whether or not `raw` was retained.
+update_with_lookup_chunked <- function(result, ...) {
+  if (is.null(result$raw) && !is.null(result$compact)) {
+    ## rehydrate only what the lookup actually touches
+    lk <- utils::read.csv(file.path(result$path, result$lookup_filename),
+                          stringsAsFactors = FALSE)
+    ids <- intersect(unique(lk$record_uid), names(result$results))
+    result$raw <- pf_result_raw(result, ids)
+  }
+  out <- update_with_lookup(result, ...)
+  out$metadata <- result$metadata
+  out
+}
+
 # ---------- Optional inspection pass -----------------------------------------
 
 inspect_chrom_folder <- function(
@@ -2373,4 +2655,31 @@ append_retention_database <- function(
   }
 
   db[]
+}
+
+# ---------- Memory diagnostics ------------------------------------------------
+
+pf_memory_report <- function(raw, n_workers = 1L) {
+  mb <- function(x) as.numeric(utils::object.size(x)) / 1024^2
+  ids <- unique(raw$record_uid)
+  per <- mb(raw) / length(ids)
+  dat <- sum(vapply(c("time_min", "intensity"),
+                    function(cn) mb(raw[[cn]]), numeric(1))) / length(ids)
+  cat(sprintf("records                : %d\n", length(ids)))
+  cat(sprintf("raw table              : %8.1f MB  (%.2f MB/record)\n", mb(raw), per))
+  cat(sprintf("  of which real data   : %8.1f MB  (%.0f%%)\n",
+              dat * length(ids), 100 * dat / per))
+  cat(sprintf("  metadata replication : %8.1f MB  (%.0f%%)\n",
+              (per - dat) * length(ids), 100 * (per - dat) / per))
+  cat(sprintf("compact tasks would be : %8.1f MB\n", dat * length(ids)))
+  cat(sprintf("a full `chrom` list adds: %8.1f MB (duplicate of raw)\n", mb(raw)))
+  cat(sprintf("processed_trace in results adds ~%8.1f MB\n", 1.4 * mb(raw)))
+  ## naive = raw + chrom duplicate + results with traces
+  ## chunked = compacted raw + one chunk in flight per worker
+  chunk <- min(150L, length(ids))
+  cat(sprintf("\nnaive peak            ~ %6.2f GB\n", (mb(raw) * 3.4) / 1024))
+  cat(sprintf("compacted + chunked   ~ %6.2f GB  (chunk = %d, workers = %d)\n",
+              (dat * length(ids) + dat * chunk * (1 + n_workers)) / 1024,
+              chunk, n_workers))
+  invisible(NULL)
 }
