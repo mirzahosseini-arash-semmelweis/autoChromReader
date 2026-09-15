@@ -1286,7 +1286,7 @@ plot_peak_qc <- function(result) {
   d   <- result$processed_trace
   pks <- result$peaks
   run <- result$run
-
+  
   p <- ggplot(d, aes(time_min, intensity_corrected)) +
     geom_line(linewidth = 0.35) +
     geom_line(
@@ -1315,7 +1315,7 @@ plot_peak_qc <- function(result) {
       breaks       = scales::breaks_extended(n = 10),
       minor_breaks = scales::breaks_width(0.5) 
     )
-
+  
   if (nrow(pks)) {
     pp <- copy(pks)
     pp[, label := fifelse(
@@ -1329,7 +1329,7 @@ plot_peak_qc <- function(result) {
         fifelse(deconvolved, " [EGH]", "")
       )
     )]
-
+    
     p <- p +
       geom_vline(
         data = pp,
@@ -1372,7 +1372,7 @@ plot_peak_qc <- function(result) {
       labs(color = "Peak") +
       scale_y_continuous(expand = expansion(mult = c(0.05, 0.18)))
   }
-
+  
   ## If t0 is a supplied value rather than a visible marker, show it separately.
   if (isTRUE(run$t0_available[1L]) && !isTRUE(run$t0_marker_found[1L])) {
     p <- p +
@@ -1391,7 +1391,7 @@ plot_peak_qc <- function(result) {
         size  = 2.5
       )
   }
-
+  
   p +
     annotate(
       "label",
@@ -2119,132 +2119,21 @@ analyze_chrom_folder <- function(
   )
 }
 
-# ---------- Incremental lookup update ----------------------------------------
-
-update_with_lookup <- function(
-    result,
-    lookup_filename = result$lookup_filename,
-    save_qc         = result$save_qc,
-    qc_subdir       = result$qc_subdir,
-    n_workers       = 1L,
-    seed            = 1L,
-    progress        = TRUE
-  ) {
-
-  if (is.null(result$settings) || is.null(result$raw) || is.null(result$results)) {
-    stop(
-      "result does not contain the settings/raw/results fields required for an ",
-      "incremental lookup update. Re-run analyze_chrom_folder() with this version."
-    )
-  }
-
-  path   <- result$path
-  lookup <- read_peak_lookup(path, lookup_filename)
-  active <- lookup_rows_with_info(lookup)
-
-  ## Backward-compatible un-exclusion: old templates commonly contain FALSE in
-  ## every row. A FALSE becomes actionable only if that run is currently marked
-  ## excluded in the result being updated.
-  if ("exclude" %in% names(lookup) && "excluded" %in% names(result$runs)) {
-    currently_excluded <- result$runs[excluded == TRUE, unique(record_uid)]
-    unexclude <- lookup[!is.na(exclude) & exclude == FALSE & record_uid %in% currently_excluded]
-    if (nrow(unexclude)) {
-      active <- unique(rbindlist(list(active, unexclude), use.names = TRUE, fill = TRUE), by = "record_uid")
-    }
-  }
-
-  if (!nrow(active)) {
-    message("Lookup contains no rows with operator-specified information; nothing to update.")
-    return(result)
-  }
-
-  known   <- names(result$results)
-  unknown <- setdiff(active$record_uid, known)
-  if (length(unknown)) {
-    warning(
-      "Ignoring lookup rows for filenames not present in the analyzed result: ",
-      paste(unknown, collapse = ", ")
-    )
-  }
-
-  target <- intersect(active$record_uid, known)
-  if (!length(target)) {
-    message("No lookup rows correspond to files in this result; nothing to update.")
-    return(result)
-  }
-
-  message(
-    "Updating ", length(target), " chromatogram(s) out of ", length(known),
-    " using lookup guidance."
-  )
-
-  tasks <- setNames(
-    lapply(target, function(id) list(
-      data   = result$raw[record_uid == id],
-      lookup = active[record_uid == id][1L]
-    )),
-    target
-  )
-
-  settings <- result$settings
-
-  worker <- function(task) {
-    do.call(
-      analyze_one_chromatogram,
-      c(list(d = task$data, lookup = task$lookup), settings)
-    )
-  }
-
-  updated <- .parallel_lapply(
-    tasks,
-    worker,
-    n_workers = n_workers,
-    seed      = seed,
-    progress  = progress
-  )
-  names(updated) <- target
-
-  for (id in target) {
-    result$results[[id]] <- updated[[id]]
-  }
-
-  if (isTRUE(save_qc)) {
-    qc_dir <- file.path(path, qc_subdir)
-    for (id in target) {
-      save_peak_qc(result$results[[id]], qc_dir = qc_dir)
-    }
-  }
-
-  out <- assemble_analysis_result(
-    raw                                = result$raw,
-    results                            = result$results,
-    path                               = path,
-    settings                           = result$settings,
-    lookup_filename                    = lookup_filename,
-    qc_subdir                          = qc_subdir,
-    save_qc                            = save_qc,
-    cross_wavelength_tolerance_min     = result$cross_wavelength_tolerance_min,
-    snap_to_cross_wavelength_consensus = result$snap_to_cross_wavelength_consensus
-  )
-
-  out$updated_from_lookup <- target
-  out
-}
-
 # ---------- Memory-efficient batched processing ------------------------------
 
-.pf_make_analysis_worker <- function(
+.pf_make_worker <- function(
     settings,
     keep_traces = FALSE,
     qc_dir      = NULL
-) {
+  ) {
   force(settings); force(keep_traces); force(qc_dir)
   function(task) {
     d <- .pf_task_to_dt(task)
-    r <- do.call(analyze_one_chromatogram,
-                 c(list(d = d, lookup = NULL), settings))
-    ## Render QC inside the worker so the trace never travels back, and only
-    ## the file path does.
+    r <- do.call(
+      analyze_one_chromatogram,
+      c(list(d = d, lookup = if (is.null(task$lookup)) NULL else task$lookup),
+        settings)
+    )
     if (!is.null(qc_dir)) {
       p <- try(save_peak_qc(r, qc_dir = qc_dir), silent = TRUE)
       r$qc_path <- if (inherits(p, "try-error")) NA_character_ else p
@@ -2254,9 +2143,15 @@ update_with_lookup <- function(
   }
 }
 
+.pf_make_analysis_worker <- function(
+    settings,
+    keep_traces = FALSE,
+    qc_dir      = NULL
+  ) {
+  .pf_make_worker(settings, keep_traces, qc_dir)
+}
+
 ## Rebuild the full-schema data.table one record at a time, inside the worker.
-## Cheap (one record is 3.7 MB transiently) and lets analyze_one_chromatogram()
-## stay exactly as it is.
 .pf_task_to_dt <- function(task) {
   d <- data.table::copy(task$trace)
   m <- task$meta
@@ -2279,14 +2174,31 @@ pf_compact_raw <- function(raw) {
   list(traces = traces, meta = meta)
 }
 
-#' Build compact tasks from the output of pf_compact_raw().
-pf_tasks_from_compact <- function(cmp, ids) {
-  j   <- match(ids, cmp$meta$record_uid)
-  idx <- split(seq_len(nrow(cmp$traces)), cmp$traces$rid)
+pf_trace_index <- function(cmp) split(seq_len(nrow(cmp$traces)), cmp$traces$rid)
+
+pf_tasks_from_compact <- function(cmp, ids, index = NULL) {
+  j <- match(ids, cmp$meta$record_uid)
+  if (is.null(index)) index <- pf_trace_index(cmp)
   lapply(seq_along(ids), function(k) {
-    i <- idx[[as.character(j[k])]]
+    i <- index[[as.character(j[k])]]
     list(trace = cmp$traces[i, .(time_min, intensity)],
          meta  = cmp$meta[j[k]])
+  })
+}
+
+#' Compact tasks for the given records, from whichever source the result has.
+pf_tasks_for <- function(result, ids, index = NULL) {
+  if (!is.null(result$compact)) {
+    return(pf_tasks_from_compact(result$compact, ids, index))
+  }
+  if (is.null(result$raw)) {
+    stop("result carries neither `raw` nor `compact`.")
+  }
+  meta_cols <- setdiff(names(result$raw), c("time_min", "intensity"))
+  lapply(ids, function(id) {
+    d <- result$raw[record_uid == id]
+    list(trace = d[, .(time_min, intensity)],
+         meta  = d[1L, ..meta_cols])
   })
 }
 
@@ -2483,37 +2395,137 @@ analyze_chrom_folder_chunked <- function(
 }
 
 # ---------- Update that works with or without keep_raw -----------------------
-
-#' Rows of the original full-schema table for the given record ids, taken from
-#' `result$raw` if it was kept and rebuilt from `result$compact` if not.
-pf_result_raw <- function(result, ids = NULL) {
-  if (!is.null(result$raw)) {
-    return(if (is.null(ids)) result$raw else result$raw[record_uid %in% ids])
+#' Apply operator guidance from the lookup table, in batches.
+#'
+#' @param chunk records per batch. Peak memory is set by this, not by how many
+#'   records the lookup touches.
+#' @param keep_traces NULL infers it from the result (whether the existing
+#'   per-record objects carry a processed_trace), so an update does not silently
+#'   change the shape of the object it was handed.
+#' @param per_record_seed seed each record from its record_uid, making the
+#'   result independent of batch size, worker count and ordering. FALSE
+#'   reproduces the pre-batching RNG behaviour.
+update_with_lookup <- function(
+    result,
+    lookup_filename = result$lookup_filename,
+    save_qc         = result$save_qc,
+    qc_subdir       = result$qc_subdir,
+    chunk           = 150L,
+    keep_traces     = NULL,
+    n_workers       = 1L,
+    seed            = 1L,
+    per_record_seed = TRUE,
+    progress        = TRUE
+) {
+  
+  if (is.null(result$settings) || is.null(result$results)) {
+    stop("result does not contain the settings/results fields required for an ",
+         "incremental lookup update. Re-run analyze_chrom_folder() or ",
+         "analyze_chrom_folder_chunked() with this version.")
   }
-  if (is.null(result$compact)) {
-    stop("result carries neither `raw` nor `compact`; re-run with keep_raw = TRUE.")
+  if (is.null(result$raw) && is.null(result$compact)) {
+    stop("result carries neither `raw` nor `compact`, so the traces cannot be ",
+         "recovered. Re-run with keep_raw = TRUE, or keep the `compact` field ",
+         "that analyze_chrom_folder_chunked() attaches.")
   }
-  cmp <- result$compact
-  if (is.null(ids)) ids <- cmp$meta$record_uid
-  data.table::rbindlist(
-    lapply(pf_tasks_from_compact(cmp, ids), .pf_task_to_dt),
-    use.names = TRUE, fill = TRUE
+  
+  path   <- result$path
+  lookup <- read_peak_lookup(path, lookup_filename)
+  active <- lookup_rows_with_info(lookup)
+  
+  ## Backward-compatible un-exclusion: old templates commonly contain FALSE in
+  ## every row. A FALSE becomes actionable only if that run is currently marked
+  ## excluded in the result being updated.
+  if ("exclude" %in% names(lookup) && "excluded" %in% names(result$runs)) {
+    currently_excluded <- result$runs[excluded == TRUE, unique(record_uid)]
+    unexclude <- lookup[!is.na(exclude) & exclude == FALSE &record_uid %in% currently_excluded]
+    if (nrow(unexclude)) {
+      active <- unique(rbindlist(list(active, unexclude), use.names = TRUE, fill = TRUE),
+                       by = "record_uid")
+    }
+  }
+  
+  if (!nrow(active)) {
+    message("Lookup contains no rows with operator-specified information; ",
+            "nothing to update.")
+    return(result)
+  }
+  
+  known   <- names(result$results)
+  unknown <- setdiff(active$record_uid, known)
+  if (length(unknown)) {
+    warning("Ignoring lookup rows for records not present in the analyzed ",
+            "result: ", paste(unknown, collapse = ", "))
+  }
+  
+  target <- intersect(active$record_uid, known)
+  if (!length(target)) {
+    message("No lookup rows correspond to files in this result; nothing to update.")
+    return(result)
+  }
+  
+  ## Match the shape of what we were handed rather than imposing one.
+  if (is.null(keep_traces)) {
+    keep_traces <- !is.null(result$results[[1L]]$processed_trace)
+  }
+  
+  qc_dir <- if (isTRUE(save_qc)) file.path(path, qc_subdir) else NULL
+  if (!is.null(qc_dir)) dir.create(qc_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  worker <- .pf_make_worker(
+    result$settings,
+    keep_traces = keep_traces,
+    qc_dir      = qc_dir
   )
-}
-
-#' update_with_lookup() for results produced by analyze_chrom_folder_chunked().
-#' Identical to the original except that it pulls records through
-#' pf_result_raw(), so it works whether or not `raw` was retained.
-update_with_lookup_chunked <- function(result, ...) {
-  if (is.null(result$raw) && !is.null(result$compact)) {
-    ## rehydrate only what the lookup actually touches
-    lk <- utils::read.csv(file.path(result$path, result$lookup_filename),
-                          stringsAsFactors = FALSE)
-    ids <- intersect(unique(lk$record_uid), names(result$results))
-    result$raw <- pf_result_raw(result, ids)
+  
+  ## index the traces once, not once per batch
+  idx <- if (!is.null(result$compact)) pf_trace_index(result$compact) else NULL
+  
+  n       <- length(target)
+  n_chunk <- ceiling(n / chunk)
+  message("Updating ", n, " chromatogram(s) out of ", length(known),
+          " using lookup guidance",
+          if (n_chunk > 1L) paste0(" in ", n_chunk, " batches") else "", ".")
+  
+  for (b in seq_len(n_chunk)) {
+    from  <- (b - 1L) * chunk + 1L
+    to    <- min(from + chunk - 1L, n)
+    ids_b <- target[from:to]
+    if (isTRUE(progress) && n_chunk > 1L) {
+      message(sprintf("  batch %d/%d: records %d-%d", b, n_chunk, from, to))
+    }
+    
+    tasks <- pf_tasks_for(result, ids_b, index = idx)
+    for (k in seq_along(ids_b)) {
+      tasks[[k]]$lookup <- active[record_uid == ids_b[k]][1L]
+    }
+    names(tasks) <- ids_b
+    
+    upd <- .parallel_lapply(tasks, worker, n_workers = n_workers,
+                            seed = seed, progress = progress)
+    names(upd) <- ids_b
+    
+    ## write straight back and release the batch
+    for (id in ids_b) result$results[[id]] <- upd[[id]]
+    rm(tasks, upd); invisible(gc(FALSE))
   }
-  out <- update_with_lookup(result, ...)
-  out$metadata <- result$metadata
+  
+  out <- assemble_analysis_result(
+    raw                                = result$raw,
+    results                            = result$results,
+    path                               = path,
+    settings                           = result$settings,
+    lookup_filename                    = lookup_filename,
+    qc_subdir                          = qc_subdir,
+    save_qc                            = save_qc,
+    cross_wavelength_tolerance_min     = result$cross_wavelength_tolerance_min,
+    snap_to_cross_wavelength_consensus = result$snap_to_cross_wavelength_consensus
+  )
+  
+  ## carry the extra fields through so the result stays re-updatable
+  out$metadata            <- result$metadata
+  out$compact             <- result$compact
+  out$updated_from_lookup <- target
   out
 }
 
