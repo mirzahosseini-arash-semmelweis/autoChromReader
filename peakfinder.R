@@ -1307,7 +1307,14 @@ plot_peak_qc <- function(result) {
       y = "Intensity"
     ) +
     theme_bw() +
-    theme(panel.grid.minor = element_blank())
+    theme(
+      panel.grid.minor    = element_line(color = "grey92", linewidth = 0.25),
+      axis.ticks.length.x = unit(0.15, "cm")
+    ) +
+    scale_x_continuous(
+      breaks       = scales::breaks_extended(n = 10),
+      minor_breaks = scales::breaks_width(0.5) 
+    )
 
   if (nrow(pks)) {
     pp <- copy(pks)
@@ -1362,7 +1369,8 @@ plot_peak_qc <- function(result) {
         check_overlap = TRUE,
         inherit.aes   = FALSE
       ) +
-      labs(color = "Peak")
+      labs(color = "Peak") +
+      scale_y_continuous(expand = expansion(mult = c(0.05, 0.18)))
   }
 
   ## If t0 is a supplied value rather than a visible marker, show it separately.
