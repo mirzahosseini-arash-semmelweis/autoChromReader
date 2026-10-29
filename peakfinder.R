@@ -1,5 +1,20 @@
 ## ---------------------------------------------------------------------------
 ##  peakfinder.R -- Folder-level HPLC retention/FWHM extraction pipeline.
+##
+##  [MODIFIED v0.6.0]
+##   * baseline_method gains "psalsa", "arpls", "asls" (whittaker_args).
+##   * optional denoiser after baseline correction (denoise_method,
+##     denoise_args); the denoised trace is kept as intensity_denoised.
+##   * cluster deconvolution uses the bi-directional EMG (BEMG) instead of
+##     EGH; deconv_tau is replaced by deconv_tau_left / deconv_tau_right and
+##     deconv_mu; fwhm_method "BEMG_deconvolution".
+##   * new defaults so that every statistically real peak is reported:
+##     relative_height_min = 0 (was 0.25), do_shoulders = TRUE (was FALSE),
+##     min_peak_distance_min = NULL -> resolution-based suppression
+##     (min_peak_resolution = 0.25) instead of a fixed 0.05 min.
+##   * deconv_require_same_count = FALSE now adds BIC-proposed hidden
+##     components as analytes (peak_source "deconvolution_hidden").
+##   * every resolved hyperparameter is stored per run (run$hyperparameters).
 ## ---------------------------------------------------------------------------
 
 suppressWarnings(
@@ -15,7 +30,7 @@ suppressWarnings(
   })
 )
 
-PEAKFINDER_VERSION <- "0.5.0"
+PEAKFINDER_VERSION <- "0.6.0"
 
 # ---------- Lookup ------------------------------------------------------------
 
@@ -217,13 +232,14 @@ auto_mile_mollify_hw <- function(
 
 preprocess_chromatogram <- function(
     d,
-    baseline_method          = c("flatfit", "mile"),
+    baseline_method          = c("flatfit", "mile", "psalsa", "arpls", "asls"),
     flatfit_args             = list(),
     mile_args                = list(),
     mile_auto_mollify        = TRUE,
     mile_mollify_fraction    = 0.10,
     mile_mollify_max_hw      = 15L,
-    mile_mollify_min_base_hw = 8L
+    mile_mollify_min_base_hw = 8L,
+    whittaker_args           = list()
   ) {
 
   baseline_method <- match.arg(baseline_method)
@@ -239,7 +255,7 @@ preprocess_chromatogram <- function(
     mf <- do.call(flatfit, args)
     
     if (length(mf$baseline) != nrow(d) || length(mf$corrected) != nrow(d)) {
-      stop("mile() returned vectors of unexpected length for: ", d$filename[1L])
+      stop("flatfit() returned vectors of unexpected length for: ", d$filename[1L])
     }
     
     d[, `:=`(
@@ -252,9 +268,9 @@ preprocess_chromatogram <- function(
       flatfit_iterations  = as.numeric(mf$iterations)
     )]
     
-    attr(d, "flatfit_result") <- mf
+    setattr(d, "flatfit_result", mf)   # [MODIFIED] setattr: no copy, keeps := valid
     
-  } else {
+  } else if (baseline_method == "mile") {
     
     args   <- mile_args
     args$y <- d$intensity
@@ -298,7 +314,34 @@ preprocess_chromatogram <- function(
       mile_iterations     = as.integer(mf$iterations)
     )]
     
-    attr(d, "mile_result") <- mf
+    setattr(d, "mile_result", mf)
+
+  } else {
+
+    ## [NEW] Whittaker family: PSALSA / arPLS / AsLS (baseline_flatfit.R)
+    args        <- whittaker_args
+    args$y      <- d$intensity
+    args$x      <- d$time_min
+    args$method <- baseline_method
+
+    mf <- do.call(whittaker_baseline, args)
+
+    if (length(mf$baseline) != nrow(d) || length(mf$corrected) != nrow(d)) {
+      stop("whittaker_baseline() returned vectors of unexpected length for: ",
+           d$filename[1L])
+    }
+
+    d[, `:=`(
+      baseline             = as.numeric(mf$baseline),
+      intensity_corrected  = as.numeric(mf$corrected),
+      whittaker_lambda     = as.numeric(mf$lambda),
+      whittaker_hw         = as.integer(mf$hw),
+      whittaker_p          = as.numeric(mf$p),
+      whittaker_k          = as.numeric(mf$k),
+      whittaker_iterations = as.integer(mf$iterations)
+    )]
+
+    setattr(d, "whittaker_result", mf)
   }
   
   d[]
@@ -353,7 +396,8 @@ trapz_base <- function(x, y) {
 snap_to_local_apex <- function(proc, hint_min, window_min = 0.10) {
   ii <- which(abs(proc$time_min - hint_min) <= window_min)
   if (!length(ii)) return(NA_integer_)
-  ii[which.max(proc$intensity_corrected[ii])]
+  yy <- if ("intensity_denoised" %in% names(proc)) proc$intensity_denoised else proc$intensity_corrected
+  ii[which.max(yy[ii])]
 }
 
 nearest_picker_peak <- function(pk, hint_min, window_min = 0.10) {
@@ -369,10 +413,20 @@ nearest_picker_peak <- function(pk, hint_min, window_min = 0.10) {
   as.integer(best[1L])
 }
 
+#' Keep the strongest of any two candidates that are too close together.
+#'
+#' [MODIFIED] Closeness is judged by chromatographic resolution, computed from
+#' the picker FWHMs, Rs = 1.18 * |dt| / (w1 + w2): two candidates with
+#' Rs < min_peak_resolution (default 0.25) are treated as one peak -- below
+#' that, two components are not identifiable from a single trace anyway (see
+#' pick_peaks()). This is scale free, unlike the old fixed 0.05 min, which
+#' removed real, visibly separate shoulders of narrow peaks. Supplying a
+#' numeric min_peak_distance_min restores the old fixed-distance rule.
 suppress_close_picker_peaks <- function(
     pk,
-    min_peak_distance_min = 0.05,
-    max_peaks             = Inf
+    min_peak_distance_min = NULL,
+    max_peaks             = Inf,
+    min_peak_resolution   = 0.25
   ) {
 
   if (!nrow(pk)) return(pk)
@@ -380,9 +434,17 @@ suppress_close_picker_peaks <- function(
   ord    <- order(pk$snr, pk$height, decreasing = TRUE)
   chosen <- integer()
 
+  too_close <- function(j, others) {
+    if (!is.null(min_peak_distance_min) && is.finite(min_peak_distance_min)) {
+      return(any(abs(pk$rt[j] - pk$rt[others]) < min_peak_distance_min))
+    }
+    w  <- pk$fwhm[j] + pk$fwhm[others]
+    rs <- 1.18 * abs(pk$rt[j] - pk$rt[others]) / w
+    any(is.finite(rs) & rs < min_peak_resolution)
+  }
+
   for (j in ord) {
-    if (!length(chosen) ||
-        all(abs(pk$rt[j] - pk$rt[chosen]) >= min_peak_distance_min)) {
+    if (!length(chosen) || !too_close(j, chosen)) {
       chosen <- c(chosen, j)
       if (length(chosen) >= max_peaks) break
     }
@@ -431,7 +493,7 @@ standardize_picker_peak <- function(
       fwhm_left_min        = as.numeric(row$deconv_fwhm_left[1L]),
       fwhm_right_min       = as.numeric(row$deconv_fwhm_right[1L]),
       fwhm_min             = fwhm,
-      fwhm_method          = "EGH_deconvolution",
+      fwhm_method          = "BEMG_deconvolution",
       half_level_corrected = height / 2,
       half_level_raw       = baseline_rt + height / 2,
       fwhm_clean           = is.finite(fwhm) && isTRUE(row$deconv_converged[1L]),
@@ -443,8 +505,10 @@ standardize_picker_peak <- function(
       picker_resolution    = as.numeric(row$resolution[1L]),
       clustered            = TRUE,
       deconvolved          = TRUE,
+      deconv_mu            = as.numeric(row$deconv_mu[1L]),
       deconv_sigma         = as.numeric(row$deconv_sigma[1L]),
-      deconv_tau           = as.numeric(row$deconv_tau[1L]),
+      deconv_tau_left      = as.numeric(row$deconv_tau_left[1L]),
+      deconv_tau_right     = as.numeric(row$deconv_tau_right[1L]),
       deconv_k_detected    = as.integer(row$deconv_k_detected[1L]),
       deconv_k_fitted      = as.integer(row$deconv_k_fitted[1L])
     ))
@@ -480,8 +544,10 @@ standardize_picker_peak <- function(
     picker_resolution    = as.numeric(row$resolution[1L]),
     clustered            = if ("deconv_attempted" %in% names(row)) isTRUE(row$deconv_attempted[1L]) else FALSE,
     deconvolved          = FALSE,
+    deconv_mu            = NA_real_,
     deconv_sigma         = NA_real_,
-    deconv_tau           = NA_real_,
+    deconv_tau_left      = NA_real_,
+    deconv_tau_right     = NA_real_,
     deconv_k_detected    = if ("deconv_k_detected" %in% names(row)) as.integer(row$deconv_k_detected[1L]) else NA_integer_,
     deconv_k_fitted      = if ("deconv_k_fitted" %in% names(row)) as.integer(row$deconv_k_fitted[1L]) else NA_integer_
   )
@@ -498,7 +564,8 @@ standardize_manual_peak <- function(
   ) {
 
   t   <- proc$time_min
-  y   <- proc$intensity_corrected
+  ## [MODIFIED] geometry from the denoised trace when a denoiser was used
+  y   <- if ("intensity_denoised" %in% names(proc)) proc$intensity_denoised else proc$intensity_corrected
   raw <- proc$intensity
   n   <- nrow(proc)
 
@@ -558,14 +625,36 @@ standardize_manual_peak <- function(
     picker_resolution    = NA_real_,
     clustered            = FALSE,
     deconvolved          = FALSE,
+    deconv_mu            = NA_real_,
     deconv_sigma         = NA_real_,
-    deconv_tau           = NA_real_,
+    deconv_tau_left      = NA_real_,
+    deconv_tau_right     = NA_real_,
     deconv_k_detected    = NA_integer_,
     deconv_k_fitted      = NA_integer_
   )
 }
 
 # ---------- Cluster deconvolution ---------------------------------------------
+
+## Order-preserving assignment of k_detected detected peaks to k_fitted >=
+## k_detected fitted components, minimising the summed |delta rt| (dynamic
+## programming). Returns the fitted index for each detected peak.
+.match_ordered <- function(rt_det, rt_fit) {
+  a <- length(rt_det); b <- length(rt_fit)
+  if (a == 0L) return(integer())
+  if (a == b) return(seq_len(a))
+  C <- matrix(Inf, a + 1L, b + 1L); C[1L, ] <- 0
+  for (i in seq_len(a)) for (j in i:b) {
+    C[i + 1L, j + 1L] <- min(C[i + 1L, j],
+                             C[i, j] + abs(rt_det[i] - rt_fit[j]))
+  }
+  out <- integer(a); j <- b
+  for (i in a:1) {
+    while (j > i && C[i + 1L, j + 1L] == C[i + 1L, j]) j <- j - 1L
+    out[i] <- j; j <- j - 1L
+  }
+  out
+}
 
 add_cluster_deconvolution <- function(
     proc,
@@ -575,8 +664,12 @@ add_cluster_deconvolution <- function(
     min_members        = 2L,
     pad                = 1.5,
     k_max              = 4L,
+    k_extra            = 2L,
     min_snr            = 20,
-    require_same_count = TRUE
+    require_same_count = TRUE,
+    model_tol          = 0.01,
+    min_fit_rs         = 0.35,
+    noise_sd           = NA_real_
   ) {
 
   pk <- copy(pk)
@@ -585,13 +678,15 @@ add_cluster_deconvolution <- function(
     deconv_attempted   = FALSE,
     deconv_accepted    = FALSE,
     deconv_rt          = NA_real_,
+    deconv_mu          = NA_real_,
     deconv_height      = NA_real_,
     deconv_fwhm        = NA_real_,
     deconv_fwhm_left   = NA_real_,
     deconv_fwhm_right  = NA_real_,
     deconv_area        = NA_real_,
     deconv_sigma       = NA_real_,
-    deconv_tau         = NA_real_,
+    deconv_tau_left    = NA_real_,
+    deconv_tau_right   = NA_real_,
     deconv_converged   = NA,
     deconv_k_detected  = NA_integer_,
     deconv_k_fitted    = NA_integer_,
@@ -608,6 +703,8 @@ add_cluster_deconvolution <- function(
     accepted_clusters     = integer(),
     disagreement_clusters = integer(),
     failed_clusters       = integer(),
+    hidden_clusters       = integer(),
+    hidden_rows           = integer(),
     fit                   = NULL,
     bic                   = NULL
   )
@@ -632,6 +729,8 @@ add_cluster_deconvolution <- function(
     pk_fit$resolution <- pk_fit$picker_resolution
   }
 
+  ## BEMG model fitted to the baseline-corrected but UNSMOOTHED trace: least
+  ## squares is unbiased under noise, and smoothing would broaden the shapes
   fit <- try(
     deconvolve_clusters(
       x           = proc$time_min,
@@ -640,7 +739,10 @@ add_cluster_deconvolution <- function(
       min_members = as.integer(min_members),
       pad         = pad,
       k_max       = as.integer(k_max),
-      min_snr     = min_snr
+      k_extra     = as.integer(k_extra),
+      min_snr     = min_snr,
+      model_tol   = model_tol,
+      min_fit_rs  = min_fit_rs
     ),
     silent = TRUE
   )
@@ -667,6 +769,23 @@ add_cluster_deconvolution <- function(
   info$fit <- fit
   info$bic <- fit_bic
 
+  fill_row <- function(r, f) {
+    pk[r, `:=`(
+      deconv_accepted   = TRUE,
+      deconv_rt         = as.numeric(f$rt),
+      deconv_mu         = as.numeric(f$mu),
+      deconv_height     = as.numeric(f$height),
+      deconv_fwhm       = as.numeric(f$fwhm),
+      deconv_fwhm_left  = as.numeric(f$fwhm_left),
+      deconv_fwhm_right = as.numeric(f$fwhm_right),
+      deconv_area       = as.numeric(f$area),
+      deconv_sigma      = as.numeric(f$sigma),
+      deconv_tau_left   = as.numeric(f$tau_left),
+      deconv_tau_right  = as.numeric(f$tau_right),
+      deconv_converged  = isTRUE(f$converged)
+    )]
+  }
+
   for (cid in cluster_ids) {
     rows <- picker_rows[pk$cluster[picker_rows] == cid]
     rows <- rows[order(pk$rt[rows])]
@@ -686,7 +805,11 @@ add_cluster_deconvolution <- function(
       next
     }
 
-    if (isTRUE(require_same_count) && k_fitted != k_detected) {
+    ## Fewer fitted than detected components is always a review case, and so
+    ## is any count difference when require_same_count = TRUE (default): the
+    ## picker values are kept and the run is flagged.
+    if (k_fitted < k_detected ||
+        (isTRUE(require_same_count) && k_fitted != k_detected)) {
       info$disagreement_clusters <- c(
         info$disagreement_clusters,
         as.integer(cid)
@@ -694,32 +817,38 @@ add_cluster_deconvolution <- function(
       next
     }
 
-    ## Automatic replacement is deliberately restricted to one-to-one detected
-    ## versus fitted components. If different counts are ever allowed, that is a
-    ## model-selection decision and should not be mapped silently by proximity.
-    if (k_fitted != k_detected) {
-      info$disagreement_clusters <- c(
-        info$disagreement_clusters,
-        as.integer(cid)
-      )
-      next
-    }
+    ## Equal counts: one-to-one in retention order. More fitted than detected
+    ## (only with require_same_count = FALSE): order-preserving minimum-
+    ## distance matching; the unmatched components are BIC-proposed hidden
+    ## peaks and are appended to the candidate table.
+    mt <- .match_ordered(pk$rt[rows], ff$rt)
+    for (j in seq_along(rows)) fill_row(rows[j], ff[mt[j]])
 
-    for (j in seq_along(rows)) {
-      r <- rows[j]
-      f <- ff[j]
-      pk[r, `:=`(
-        deconv_accepted   = TRUE,
-        deconv_rt         = as.numeric(f$rt),
-        deconv_height     = as.numeric(f$height),
-        deconv_fwhm       = as.numeric(f$fwhm),
-        deconv_fwhm_left  = as.numeric(f$fwhm_left),
-        deconv_fwhm_right = as.numeric(f$fwhm_right),
-        deconv_area       = as.numeric(f$area),
-        deconv_sigma      = as.numeric(f$sigma),
-        deconv_tau        = as.numeric(f$tau),
-        deconv_converged  = isTRUE(f$converged)
-      )]
+    extra <- setdiff(seq_len(k_fitted), mt)
+    if (length(extra)) {
+      tt <- proc$time_min
+      for (e in extra) {
+        f    <- ff[e]
+        i_new <- which.min(abs(tt - f$rt))   # not `idx`: that is a pk column
+        span <- 3 * (f$sigma + f$tau_left)
+        spr  <- 3 * (f$sigma + f$tau_right)
+        lft  <- which.min(abs(tt - (f$rt - span)))
+        rgt  <- which.min(abs(tt - (f$rt + spr)))
+        new  <- pk[rows[1L]]
+        new[, `:=`(
+          rt = as.numeric(f$rt), idx = as.integer(i_new), height = as.numeric(f$height),
+          prominence = NA_real_,
+          snr = as.numeric(f$height) / max(noise_sd, .Machine$double.eps),
+          fwhm = as.numeric(f$fwhm), fwhm_left = as.numeric(f$fwhm_left),
+          fwhm_right = as.numeric(f$fwhm_right), left = as.integer(lft),
+          right = as.integer(rgt), area = as.numeric(f$area), type = "hidden",
+          saturated = FALSE, resolution = NA_real_
+        )]
+        pk <- rbind(pk, new, use.names = TRUE, fill = TRUE)
+        fill_row(nrow(pk), f)
+        info$hidden_rows <- c(info$hidden_rows, nrow(pk))
+      }
+      info$hidden_clusters <- c(info$hidden_clusters, as.integer(cid))
     }
 
     info$accepted_clusters <- c(info$accepted_clusters, as.integer(cid))
@@ -729,12 +858,34 @@ add_cluster_deconvolution <- function(
   info$accepted_clusters     <- unique(info$accepted_clusters)
   info$disagreement_clusters <- unique(info$disagreement_clusters)
   info$failed_clusters       <- unique(info$failed_clusters)
+  info$hidden_clusters       <- unique(info$hidden_clusters)
   info$pk <- pk
   info
 }
 
 # ---------- One chromatogram --------------------------------------------------
 
+#' Analyse one chromatogram.
+#'
+#' HYPERPARAMETERS (defaults are universal; nothing is re-tuned per run except
+#' what is explicitly "derived" -- and derived values are stored in
+#' run$hyperparameters for provenance):
+#'   baseline   flatfit: lambda = smoothness * n^4 (preset smoothness = 1),
+#'              SG window from the data (.ff_auto_window). mile: structuring-
+#'              element half-width from estimate_hw() ("peakwidth": half the
+#'              widest run > 3 noise-sd above a coarse opening). psalsa /
+#'              arpls / asls: lambda from the widest-peak width
+#'              (whittaker_lambda_auto, lambda_scale = 4), k = 3 noise-sd.
+#'   denoise    "none" by default; otherwise one parameter tuned per run by the
+#'              Bosten et al. (2023) ACF or RV criterion (denoise_args$tune).
+#'   detection  see pick_peaks(): noise sd measured, prominence cutoff and
+#'              shoulder threshold derived from noise surrogates at the
+#'              universal fwer = 0.05, snr_min = 20 universal.
+#'   selection  relative_height_min = 0 (no relative filter; set e.g. 0.25 to
+#'              keep only major peaks, as for enantiomer pairs), max_peaks,
+#'              resolution-based de-duplication (min_peak_resolution = 0.25).
+#'   deconvolution BEMG + BIC with effective sample size, model_tol = 0.01,
+#'              min_fit_rs = 0.35, up to detected + deconv_k_extra components.
 analyze_one_chromatogram <- function(
     d,
     lookup                    = NULL,
@@ -743,27 +894,35 @@ analyze_one_chromatogram <- function(
     t0_manual                 = NA_real_,
     analyte_lower_limit       = NULL,
     snr_min                   = 20,
-    relative_height_min       = 0.25,
+    relative_height_min       = 0,
     fwer                      = 0.05,
     min_prom                  = NULL,
     nsim                      = 25L,
-    do_shoulders              = FALSE,
-    min_peak_distance_min     = 0.05,
+    nsim_cwt                  = NULL,
+    do_shoulders              = TRUE,
+    min_peak_distance_min     = NULL,
+    min_peak_resolution       = 0.25,
     max_peaks                 = 6L,
     manual_window_min         = 0.10,
-    baseline_method           = c("flatfit", "mile"),
+    baseline_method           = c("flatfit", "mile", "psalsa", "arpls", "asls"),
     flatfit_args              = list(),
     mile_args                 = list(),
     mile_auto_mollify         = TRUE,
     mile_mollify_fraction     = 0.10,
     mile_mollify_max_hw       = 15L,
     mile_mollify_min_base_hw  = 8L,
+    whittaker_args            = list(),
+    denoise_method            = "none",
+    denoise_args              = list(),
     deconvolve_clustered      = TRUE,
     deconv_min_members        = 2L,
     deconv_pad                = 1.5,
     deconv_k_max              = 4L,
+    deconv_k_extra            = 2L,
     deconv_min_snr            = NULL,
-    deconv_require_same_count = TRUE
+    deconv_require_same_count = TRUE,
+    deconv_model_tol          = 0.01,
+    deconv_min_fit_rs         = 0.35
   ) {
 
   baseline_method <- match.arg(baseline_method)
@@ -800,7 +959,8 @@ analyze_one_chromatogram <- function(
     mile_auto_mollify        = mile_auto_mollify,
     mile_mollify_fraction    = mile_mollify_fraction,
     mile_mollify_max_hw      = mile_mollify_max_hw,
-    mile_mollify_min_base_hw = mile_mollify_min_base_hw
+    mile_mollify_min_base_hw = mile_mollify_min_base_hw,
+    whittaker_args           = whittaker_args
   )
   y    <- proc$intensity_corrected
   x    <- proc$time_min
@@ -819,9 +979,19 @@ analyze_one_chromatogram <- function(
     min_prom     = min_prom,
     snr_min      = snr_min,
     nsim         = nsim,
-    do_shoulders = do_shoulders
+    nsim_cwt     = nsim_cwt,
+    do_shoulders = do_shoulders,
+    denoise      = denoise_method,
+    denoise_args = denoise_args
   )
-  
+
+  ## keep the detector's view of the trace (identical to the corrected trace
+  ## when no denoiser is used) for plotting and manual-hint geometry
+  y_dn <- attr(pk_raw, "denoised")
+  proc[, intensity_denoised := if (is.null(y_dn)) intensity_corrected else as.numeric(y_dn)]
+  y_sel <- proc$intensity_denoised
+  hyper <- attr(pk_raw, "hyperparameters")
+
   prom_cutoff <- attr(pk_raw, "prom_cutoff")
   noise_sd    <- as.numeric(attr(pk_raw, "noise_sd"))
   if (!is.finite(noise_sd) || noise_sd <= 0) {
@@ -842,7 +1012,7 @@ analyze_one_chromatogram <- function(
   max_analyte_signal <- if (nrow(candidate_reference)) {
     max(candidate_reference$height, na.rm = TRUE)
   } else if (length(analyte_region)) {
-    max(pmax(y[analyte_region], 0), na.rm = TRUE)
+    max(pmax(y_sel[analyte_region], 0), na.rm = TRUE)
   } else {
     NA_real_
   }
@@ -941,7 +1111,8 @@ analyze_one_chromatogram <- function(
     ca <- suppress_close_picker_peaks(
       ca,
       min_peak_distance_min = min_peak_distance_min,
-      max_peaks             = max_peaks
+      max_peaks             = max_peaks,
+      min_peak_resolution   = min_peak_resolution
     )
   }
 
@@ -992,8 +1163,18 @@ analyze_one_chromatogram <- function(
         idx_j <- ca_fill$idx[j]
         rt_j  <- ca_fill$rt[j]
 
-        if (!nrow(analyte_selection) ||
-            all(abs(rt_j - x[analyte_selection$idx]) >= min_peak_distance_min)) {
+        sel_rt <- x[analyte_selection$idx]
+        far_enough <- if (!is.null(min_peak_distance_min) && is.finite(min_peak_distance_min)) {
+          all(abs(rt_j - sel_rt) >= min_peak_distance_min)
+        } else {
+          ## resolution against already selected peaks (their picker FWHM when
+          ## known, otherwise this candidate's own FWHM)
+          w_sel <- vapply(analyte_selection$picker_row, function(r)
+            if (is.finite(r)) pk$fwhm[r] else ca_fill$fwhm[j], numeric(1))
+          rs <- 1.18 * abs(rt_j - sel_rt) / (ca_fill$fwhm[j] + w_sel)
+          all(!is.finite(rs) | rs >= min_peak_resolution)
+        }
+        if (!nrow(analyte_selection) || far_enough) {
 
           row_in_pk <- which(pk$idx == idx_j)[1L]
           analyte_selection <- rbind(
@@ -1048,10 +1229,39 @@ analyze_one_chromatogram <- function(
     min_members        = deconv_min_members,
     pad                = deconv_pad,
     k_max              = deconv_k_max,
+    k_extra            = deconv_k_extra,
     min_snr            = deconv_min_snr,
-    require_same_count = deconv_require_same_count
+    require_same_count = deconv_require_same_count,
+    model_tol          = deconv_model_tol,
+    min_fit_rs         = deconv_min_fit_rs,
+    noise_sd           = noise_sd
   )
   pk <- deconv_info$pk
+
+  ## [NEW] BIC-proposed hidden components (deconv_require_same_count = FALSE)
+  ## join the analyte list, still subject to max_peaks (strongest kept).
+  if (length(deconv_info$hidden_rows)) {
+    hid <- deconv_info$hidden_rows
+    analyte_selection <- rbind(
+      analyte_selection,
+      data.table(
+        idx        = as.integer(pk$idx[hid]),
+        picker_row = as.integer(hid),
+        source     = "deconvolution_hidden"
+      )
+    )
+    analyte_selection <- unique(analyte_selection, by = "idx")
+    if (nrow(analyte_selection) > max_peaks) {
+      h_sel <- vapply(seq_len(nrow(analyte_selection)), function(j) {
+        r <- analyte_selection$picker_row[j]
+        if (is.finite(r)) {
+          if (isTRUE(pk$deconv_accepted[r])) pk$deconv_height[r] else pk$height[r]
+        } else y_sel[analyte_selection$idx[j]]
+      }, numeric(1))
+      analyte_selection <- analyte_selection[order(-h_sel)][seq_len(max_peaks)]
+    }
+    setorder(analyte_selection, idx)
+  }
 
   ## ----- standardize selected peak rows ------------------------------------
 
@@ -1143,8 +1353,10 @@ analyze_one_chromatogram <- function(
       picker_resolution    = numeric(),
       clustered            = logical(),
       deconvolved          = logical(),
+      deconv_mu            = numeric(),
       deconv_sigma         = numeric(),
-      deconv_tau           = numeric(),
+      deconv_tau_left      = numeric(),
+      deconv_tau_right     = numeric(),
       deconv_k_detected    = integer(),
       deconv_k_fitted      = integer(),
       k                    = numeric()
@@ -1183,6 +1395,8 @@ analyze_one_chromatogram <- function(
   deconvolution_applied_any            <- length(deconv_info$accepted_clusters) > 0L
   deconvolution_count_disagreement_any <- length(deconv_info$disagreement_clusters) > 0L
   deconvolution_failed_any             <- length(deconv_info$failed_clusters) > 0L
+  deconvolution_hidden_any             <- nrow(peaks) > 0L &&
+    any(peaks$peak_source == "deconvolution_hidden")
 
   qc_status <- if (excluded) {
     "excluded"
@@ -1194,6 +1408,8 @@ analyze_one_chromatogram <- function(
     "review_deconvolution_count"
   } else if (deconvolution_failed_any) {
     "review_deconvolution_fit"
+  } else if (deconvolution_hidden_any) {
+    "review_deconvolution_hidden"
   } else if (fwhm_review_any) {
     "review_fwhm"
   } else if (saturated_any) {
@@ -1215,14 +1431,41 @@ analyze_one_chromatogram <- function(
       flatfit_sg_hw      = proc$flatfit_sg_hw[1L],
       flatfit_iterations = proc$flatfit_iterations[1L]
     )
-  } else {
+  } else if (baseline_method == "mile") {
     baseline_info = list(
       mile_hw            = proc$mile_hw[1L],
       mile_smooth_hw     = proc$mile_smooth_hw[1L],
       mile_mollify_hw    = proc$mile_mollify_hw[1L],
       mile_iterations    = proc$mile_iterations[1L]
     )
+  } else {
+    baseline_info = list(
+      whittaker_method     = baseline_method,
+      whittaker_lambda     = proc$whittaker_lambda[1L],
+      whittaker_hw         = proc$whittaker_hw[1L],
+      whittaker_p          = proc$whittaker_p[1L],
+      whittaker_k          = proc$whittaker_k[1L],
+      whittaker_iterations = proc$whittaker_iterations[1L]
+    )
   }
+
+  ## [NEW] one provenance record of every resolved hyperparameter
+  hyper$baseline_method       <- baseline_method
+  hyper$baseline              <- baseline_info
+  hyper$relative_height_min   <- relative_height_min
+  hyper$min_peak_resolution   <- if (is.null(min_peak_distance_min)) min_peak_resolution else NA_real_
+  hyper$min_peak_distance_min <- if (is.null(min_peak_distance_min)) NA_real_ else min_peak_distance_min
+  hyper$max_peaks             <- max_peaks
+  hyper$deconvolution         <- list(
+    enabled            = deconvolve_clustered,
+    min_members        = deconv_min_members,
+    k_max              = deconv_k_max,
+    k_extra            = deconv_k_extra,
+    min_snr            = deconv_min_snr,
+    require_same_count = deconv_require_same_count,
+    model_tol          = deconv_model_tol,
+    min_fit_rs         = deconv_min_fit_rs
+  )
 
   run_summary <- run_meta[, .(
     record_uid,
@@ -1256,6 +1499,7 @@ analyze_one_chromatogram <- function(
     deconvolution_applied_any,
     deconvolution_count_disagreement_any,
     deconvolution_failed_any,
+    deconvolution_hidden_any,
     peak_detection_ok = n_peaks >= 1L && !excluded && (!look_for_t0 || t0_marker_found || t0_available),
     noise_sd,
     max_analyte_signal,
@@ -1263,8 +1507,14 @@ analyze_one_chromatogram <- function(
     relative_height_min,
     effective_analyte_snr_min,
     prominence_cutoff         = if (length(prom_cutoff)) as.numeric(prom_cutoff[1L]) else NA_real_,
+    shoulder_snr_cutoff       = as.numeric(hyper$shoulder_snr),
     baseline_method,
     baseline_info             = list(baseline_info),
+    denoise_method            = hyper$denoise,
+    denoise_param             = as.numeric(hyper$denoise_param),
+    denoise_tune              = as.character(hyper$denoise_tune),
+    denoise_kernel_fwhm_min   = as.numeric(hyper$denoise_kernel_fwhm_min),
+    hyperparameters           = list(hyper),
     qc_status,
     qc_note                   = lookup_note,
     peakfinder_version        = PEAKFINDER_VERSION,
@@ -1287,7 +1537,12 @@ plot_peak_qc <- function(result) {
   pks <- result$peaks
   run <- result$run
   
-  p <- ggplot(d, aes(time_min, intensity_corrected)) +
+  ## [MODIFIED] The raw trace is drawn, so that the baseline, the apex markers
+  ## (apex_intensity) and the FWHM bars (half_level_raw) -- all on the raw
+  ## scale -- line up. Previously the corrected trace was drawn and every
+  ## marker was offset by the local baseline. When a denoiser is active its
+  ## output (+ baseline) is overlaid in orange.
+  p <- ggplot(d, aes(time_min, intensity)) +
     geom_line(linewidth = 0.35) +
     geom_line(
       aes(y = baseline),
@@ -1316,6 +1571,42 @@ plot_peak_qc <- function(result) {
       minor_breaks = scales::breaks_width(0.5) 
     )
   
+  if ("intensity_denoised" %in% names(d) &&
+      !isTRUE(all.equal(d$intensity_denoised, d$intensity_corrected))) {
+    p <- p + geom_line(
+      aes(y = baseline + intensity_denoised),
+      linewidth = 0.3,
+      color     = "darkorange"
+    )
+  }
+
+  ## [NEW] fitted BEMG components of accepted clusters, drawn on the baseline
+  dec <- result$deconvolution
+  if (!is.null(dec) && !is.null(dec$fit) && length(dec$accepted_clusters)) {
+    ff <- as.data.table(dec$fit)[cluster %in% dec$accepted_clusters]
+    if (nrow(ff)) {
+      comp <- rbindlist(lapply(seq_len(nrow(ff)), function(i) {
+        f  <- ff[i]
+        lo <- f$rt - 6 * (f$sigma + f$tau_left)
+        hi <- f$rt + 6 * (f$sigma + f$tau_right)
+        dd <- d[time_min >= lo & time_min <= hi, .(time_min, baseline)]
+        dd[, `:=`(
+          y_fit = baseline + bemg(time_min, f$area, f$mu, f$sigma, f$tau_left, f$tau_right),
+          comp  = i
+        )]
+        dd
+      }))
+      p <- p + geom_line(
+        data        = comp,
+        aes(x = time_min, y = y_fit, group = comp),
+        linewidth   = 0.25,
+        linetype    = 5,
+        color       = "grey40",
+        inherit.aes = FALSE
+      )
+    }
+  }
+
   if (nrow(pks)) {
     pp <- copy(pks)
     pp[, label := fifelse(
@@ -1326,7 +1617,8 @@ plot_peak_qc <- function(result) {
         peak_index,
         tR_min,
         fifelse(is.finite(fwhm_min), sprintf("%.3f", fwhm_min), "NA"),
-        fifelse(deconvolved, " [EGH]", "")
+        fifelse(peak_source == "deconvolution_hidden", " [BEMG, hidden]",
+                fifelse(deconvolved, " [BEMG]", ""))
       )
     )]
     
@@ -1335,8 +1627,7 @@ plot_peak_qc <- function(result) {
         data = pp,
         aes(xintercept = tR_min, color = peak_type),
         linewidth   = 0.35,
-        linetype    = 3,
-        inherit.aes = FALSE
+        linetype    = 3
       ) +
       geom_point(
         data = pp,
@@ -1983,27 +2274,35 @@ analyze_chrom_folder <- function(
     t0_manual                          = NA_real_,
     analyte_lower_limit                = NULL,
     snr_min                            = 20,
-    relative_height_min                = 0.25,
+    relative_height_min                = 0,
     fwer                               = 0.05,
     min_prom                           = NULL,
     nsim                               = 25L,
-    do_shoulders                       = FALSE,
-    min_peak_distance_min              = 0.05,
+    nsim_cwt                           = NULL,
+    do_shoulders                       = TRUE,
+    min_peak_distance_min              = NULL,
+    min_peak_resolution                = 0.25,
     max_peaks                          = 6L,
     manual_window_min                  = 0.10,
-    baseline_method                    = c("flatfit", "mile"),
+    baseline_method                    = c("flatfit", "mile", "psalsa", "arpls", "asls"),
     flatfit_args                       = list(),
     mile_args                          = list(),
     mile_auto_mollify                  = TRUE,
     mile_mollify_fraction              = 0.10,
     mile_mollify_max_hw                = 15L,
     mile_mollify_min_base_hw           = 8L,
+    whittaker_args                     = list(),
+    denoise_method                     = "none",
+    denoise_args                       = list(),
     deconvolve_clustered               = TRUE,
     deconv_min_members                 = 2L,
     deconv_pad                         = 1.5,
     deconv_k_max                       = 4L,
+    deconv_k_extra                     = 2L,
     deconv_min_snr                     = NULL,
     deconv_require_same_count          = TRUE,
+    deconv_model_tol                   = 0.01,
+    deconv_min_fit_rs                  = 0.35,
     lookup_filename                    = "peakfinder_lookup.csv",
     create_lookup_template             = TRUE,
     overwrite_lookup_template          = FALSE,
@@ -2050,23 +2349,31 @@ analyze_chrom_folder <- function(
     fwer                      = fwer,
     min_prom                  = min_prom,
     nsim                      = nsim,
+    nsim_cwt                  = nsim_cwt,
     do_shoulders              = do_shoulders,
     min_peak_distance_min     = min_peak_distance_min,
+    min_peak_resolution       = min_peak_resolution,
     max_peaks                 = max_peaks,
     manual_window_min         = manual_window_min,
-    baseline_method           = baseline_method,
+    baseline_method           = match.arg(baseline_method),
     flatfit_args              = flatfit_args,
     mile_args                 = mile_args,
     mile_auto_mollify         = mile_auto_mollify,
     mile_mollify_fraction     = mile_mollify_fraction,
     mile_mollify_max_hw       = mile_mollify_max_hw,
     mile_mollify_min_base_hw  = mile_mollify_min_base_hw,
+    whittaker_args            = whittaker_args,
+    denoise_method            = match.arg(denoise_method, DENOISE_METHODS),
+    denoise_args              = denoise_args,
     deconvolve_clustered      = deconvolve_clustered,
     deconv_min_members        = deconv_min_members,
     deconv_pad                = deconv_pad,
     deconv_k_max              = deconv_k_max,
+    deconv_k_extra            = deconv_k_extra,
     deconv_min_snr            = deconv_min_snr,
-    deconv_require_same_count = deconv_require_same_count
+    deconv_require_same_count = deconv_require_same_count,
+    deconv_model_tol          = deconv_model_tol,
+    deconv_min_fit_rs         = deconv_min_fit_rs
   )
 
   record_ids <- unique(raw$record_uid)
@@ -2245,27 +2552,35 @@ analyze_chrom_folder_chunked <- function(
     t0_manual                          = NA_real_,
     analyte_lower_limit                = NULL,
     snr_min                            = 20,
-    relative_height_min                = 0.25,
+    relative_height_min                = 0,
     fwer                               = 0.05,
     min_prom                           = NULL,
     nsim                               = 25L,
-    do_shoulders                       = FALSE,
-    min_peak_distance_min              = 0.05,
+    nsim_cwt                           = NULL,
+    do_shoulders                       = TRUE,
+    min_peak_distance_min              = NULL,
+    min_peak_resolution                = 0.25,
     max_peaks                          = 6L,
     manual_window_min                  = 0.10,
-    baseline_method                    = c("flatfit", "mile"),
+    baseline_method                    = c("flatfit", "mile", "psalsa", "arpls", "asls"),
     flatfit_args                       = list(),
     mile_args                          = list(),
     mile_auto_mollify                  = TRUE,
     mile_mollify_fraction              = 0.10,
     mile_mollify_max_hw                = 15L,
     mile_mollify_min_base_hw           = 8L,
+    whittaker_args                     = list(),
+    denoise_method                     = "none",
+    denoise_args                       = list(),
     deconvolve_clustered               = TRUE,
     deconv_min_members                 = 2L,
     deconv_pad                         = 1.5,
     deconv_k_max                       = 4L,
+    deconv_k_extra                     = 2L,
     deconv_min_snr                     = NULL,
     deconv_require_same_count          = TRUE,
+    deconv_model_tol                   = 0.01,
+    deconv_min_fit_rs                  = 0.35,
     
     lookup_filename                    = "peakfinder_lookup.csv",
     create_lookup_template             = TRUE,
@@ -2316,23 +2631,31 @@ analyze_chrom_folder_chunked <- function(
     fwer                      = fwer,
     min_prom                  = min_prom,
     nsim                      = nsim,
+    nsim_cwt                  = nsim_cwt,
     do_shoulders              = do_shoulders,
     min_peak_distance_min     = min_peak_distance_min,
+    min_peak_resolution       = min_peak_resolution,
     max_peaks                 = max_peaks,
     manual_window_min         = manual_window_min,
-    baseline_method           = baseline_method,
+    baseline_method           = match.arg(baseline_method),
     flatfit_args              = flatfit_args,
     mile_args                 = mile_args,
     mile_auto_mollify         = mile_auto_mollify,
     mile_mollify_fraction     = mile_mollify_fraction,
     mile_mollify_max_hw       = mile_mollify_max_hw,
     mile_mollify_min_base_hw  = mile_mollify_min_base_hw,
+    whittaker_args            = whittaker_args,
+    denoise_method            = match.arg(denoise_method, DENOISE_METHODS),
+    denoise_args              = denoise_args,
     deconvolve_clustered      = deconvolve_clustered,
     deconv_min_members        = deconv_min_members,
     deconv_pad                = deconv_pad,
     deconv_k_max              = deconv_k_max,
+    deconv_k_extra            = deconv_k_extra,
     deconv_min_snr            = deconv_min_snr,
-    deconv_require_same_count = deconv_require_same_count
+    deconv_require_same_count = deconv_require_same_count,
+    deconv_model_tol          = deconv_model_tol,
+    deconv_min_fit_rs         = deconv_min_fit_rs
   )
   
   ids <- cmp$meta$record_uid
@@ -2533,9 +2856,10 @@ update_with_lookup <- function(
 
 inspect_chrom_folder <- function(
     path,
-    baseline_method = c("flatfit", "mile"),
+    baseline_method = c("flatfit", "mile", "psalsa", "arpls", "asls"),
     flatfit_args    = list(),
     mile_args       = list(),
+    whittaker_args  = list(),
     inspect_subdir  = "peakfinder_inspect",
     width           = 10,
     height          = 4,
@@ -2560,7 +2884,8 @@ inspect_chrom_folder <- function(
       d               = dd,
       baseline_method = baseline_method,
       flatfit_args    = flatfit_args,
-      mile_args       = mile_args
+      mile_args       = mile_args,
+      whittaker_args  = whittaker_args
     )
 
     p <- ggplot(proc, aes(time_min, intensity)) +
