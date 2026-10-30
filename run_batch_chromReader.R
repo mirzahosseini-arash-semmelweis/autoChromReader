@@ -42,13 +42,13 @@ result <- analyze_chrom_folder_chunked(
 #     fixed `param` is given; the noise threshold is re-derived through the
 #     same filter, so false-positive control is unchanged.
 #
-# Shoulders and deconvolution
+# Shoulders and decomposition
 #   do_shoulders              = TRUE   # CWT shoulder search (FALSE = faster)
 #   min_peak_resolution       = 0.25   # merge candidates closer than this Rs
-#   deconv_require_same_count = TRUE   # FALSE: add BIC-proposed hidden peaks
-#   deconv_k_extra            = 2      # hidden components tried per cluster
-#   deconv_model_tol          = 0.01   # BEMG model-error floor (x height)
-#   deconv_min_fit_rs         = 0.35   # reject fits with components closer
+#   decomp_require_same_count = TRUE   # FALSE: add BIC-proposed hidden peaks
+#   decomp_k_extra            = 2      # hidden components tried per cluster
+#   decomp_model_tol          = 0.01   # BEMG model-error floor (x height)
+#   decomp_min_fit_rs         = 0.35   # reject fits with components closer
 #
 # Example for noisy data:
 #   result <- analyze_chrom_folder_chunked(path, look_for_t0 = FALSE,

@@ -1023,14 +1023,14 @@ fit_cluster <- function(
 #' S/N of the major peak 100 and 1000; Rs from the FWHM). Smallest Rs at which
 #' BOTH components were reported in every replicate:
 #'
-#'   height ratio   prominence   + CWT shoulder   BEMG/BIC deconvolution
+#'   height ratio   prominence   + CWT shoulder   BEMG/BIC decomposition
 #'   1 : 1          0.6          0.6              0.4
 #'   1 : 0.3        0.8 - 1.0    0.7              0.4 - 0.5
 #'   1 : 0.1        1.0 - >1.0   0.8 - 1.0        0.7
 #'
 #' Nothing was resolved at Rs = 0.3 by any method, and the BIC never proposed
 #' a third component. The BEMG column assumes the cluster is fitted, i.e.
-#' deconv_min_members = 1 for clusters with a single detected apex; with the
+#' decomp_min_members = 1 for clusters with a single detected apex; with the
 #' default (2) a component hidden under a single detected apex is not looked
 #' for. Below Rs ~ 0.35 two components are not identifiable from one channel
 #' (select_components(min_fit_rs = 0.35) rejects such fits); only a second
@@ -1319,7 +1319,7 @@ pick_peaks <- function(
   ## in the RAW data to well within the noise: >= 4 consecutive points within
   ## 0.1 noise-sd of the apex value. The old rule (points >= 99.5% of the apex)
   ## also fired on the genuinely flat top of two merged, equal peaks, which
-  ## then blocked their deconvolution. Shoulders found inside a clipped
+  ## then blocked their decomposition. Shoulders found inside a clipped
   ## plateau are curvature artefacts of the plateau edges and are dropped.
   plateau_tol <- max(0.1 * sd_n, 1e-9 * max(abs(y_raw)))
   out$saturated <- vapply(seq_len(m), function(j) {
@@ -1476,7 +1476,7 @@ select_components <- function(
 #' @param k_extra [NEW] the search always goes up to (detected members +
 #'   k_extra) components, so up to k_extra hidden components per cluster can
 #'   be proposed by BIC (was fixed at +1).
-deconvolve_clusters <- function(
+decompose_clusters <- function(
     x,
     y,
     pk,

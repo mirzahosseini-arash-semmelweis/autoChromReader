@@ -5,15 +5,15 @@
 ##   * baseline_method gains "psalsa", "arpls", "asls" (whittaker_args).
 ##   * optional denoiser after baseline correction (denoise_method,
 ##     denoise_args); the denoised trace is kept as intensity_denoised.
-##   * cluster deconvolution uses the bi-directional EMG (BEMG) instead of
-##     EGH; deconv_tau is replaced by deconv_tau_left / deconv_tau_right and
-##     deconv_mu; fwhm_method "BEMG_deconvolution".
+##   * cluster decomposition uses the bi-directional EMG (BEMG) instead of
+##     EGH; decomp_tau is replaced by decomp_tau_left / decomp_tau_right and
+##     decomp_mu; fwhm_method "BEMG_decomposition".
 ##   * new defaults so that every statistically real peak is reported:
 ##     relative_height_min = 0 (was 0.25), do_shoulders = TRUE (was FALSE),
 ##     min_peak_distance_min = NULL -> resolution-based suppression
 ##     (min_peak_resolution = 0.25) instead of a fixed 0.05 min.
-##   * deconv_require_same_count = FALSE now adds BIC-proposed hidden
-##     components as analytes (peak_source "deconvolution_hidden").
+##   * decomp_require_same_count = FALSE now adds BIC-proposed hidden
+##     components as analytes (peak_source "decomposition_hidden").
 ##   * every resolved hyperparameter is stored per run (run$hyperparameters).
 ## ---------------------------------------------------------------------------
 
@@ -462,10 +462,10 @@ standardize_picker_peak <- function(
     noise_sd = NA_real_
   ) {
 
-  use_deconv <- "deconv_accepted" %in% names(row) && isTRUE(row$deconv_accepted[1L])
+  use_decomp <- "decomp_accepted" %in% names(row) && isTRUE(row$decomp_accepted[1L])
 
-  if (use_deconv) {
-    rt  <- as.numeric(row$deconv_rt[1L])
+  if (use_decomp) {
+    rt  <- as.numeric(row$decomp_rt[1L])
     idx <- which.min(abs(proc$time_min - rt))
     baseline_rt <- as.numeric(stats::approx(
       proc$time_min,
@@ -474,8 +474,8 @@ standardize_picker_peak <- function(
       rule = 2
     )$y)
 
-    height <- as.numeric(row$deconv_height[1L])
-    fwhm   <- as.numeric(row$deconv_fwhm[1L])
+    height <- as.numeric(row$decomp_height[1L])
+    fwhm   <- as.numeric(row$decomp_fwhm[1L])
 
     return(data.table(
       idx                  = as.integer(idx),
@@ -486,17 +486,17 @@ standardize_picker_peak <- function(
       apex_intensity       = baseline_rt + height,
       height               = height,
       prominence           = as.numeric(row$prominence[1L]),
-      area                 = as.numeric(row$deconv_area[1L]),
+      area                 = as.numeric(row$decomp_area[1L]),
       SNR                  = height / max(noise_sd, .Machine$double.eps),
       left_bound_min       = proc$time_min[as.integer(row$left[1L])],
       right_bound_min      = proc$time_min[as.integer(row$right[1L])],
-      fwhm_left_min        = as.numeric(row$deconv_fwhm_left[1L]),
-      fwhm_right_min       = as.numeric(row$deconv_fwhm_right[1L]),
+      fwhm_left_min        = as.numeric(row$decomp_fwhm_left[1L]),
+      fwhm_right_min       = as.numeric(row$decomp_fwhm_right[1L]),
       fwhm_min             = fwhm,
-      fwhm_method          = "BEMG_deconvolution",
+      fwhm_method          = "BEMG_decomposition",
       half_level_corrected = height / 2,
       half_level_raw       = baseline_rt + height / 2,
-      fwhm_clean           = is.finite(fwhm) && isTRUE(row$deconv_converged[1L]),
+      fwhm_clean           = is.finite(fwhm) && isTRUE(row$decomp_converged[1L]),
       overlap_flag         = FALSE,
       edge_peak            = FALSE,
       saturated            = isTRUE(row$saturated[1L]),
@@ -504,13 +504,13 @@ standardize_picker_peak <- function(
       picker_cluster       = as.integer(row$cluster[1L]),
       picker_resolution    = as.numeric(row$resolution[1L]),
       clustered            = TRUE,
-      deconvolved          = TRUE,
-      deconv_mu            = as.numeric(row$deconv_mu[1L]),
-      deconv_sigma         = as.numeric(row$deconv_sigma[1L]),
-      deconv_tau_left      = as.numeric(row$deconv_tau_left[1L]),
-      deconv_tau_right     = as.numeric(row$deconv_tau_right[1L]),
-      deconv_k_detected    = as.integer(row$deconv_k_detected[1L]),
-      deconv_k_fitted      = as.integer(row$deconv_k_fitted[1L])
+      decomposed           = TRUE,
+      decomp_mu            = as.numeric(row$decomp_mu[1L]),
+      decomp_sigma         = as.numeric(row$decomp_sigma[1L]),
+      decomp_tau_left      = as.numeric(row$decomp_tau_left[1L]),
+      decomp_tau_right     = as.numeric(row$decomp_tau_right[1L]),
+      decomp_k_detected    = as.integer(row$decomp_k_detected[1L]),
+      decomp_k_fitted      = as.integer(row$decomp_k_fitted[1L])
     ))
   }
 
@@ -542,14 +542,14 @@ standardize_picker_peak <- function(
     picker_type          = as.character(row$type[1L]),
     picker_cluster       = as.integer(row$cluster[1L]),
     picker_resolution    = as.numeric(row$resolution[1L]),
-    clustered            = if ("deconv_attempted" %in% names(row)) isTRUE(row$deconv_attempted[1L]) else FALSE,
-    deconvolved          = FALSE,
-    deconv_mu            = NA_real_,
-    deconv_sigma         = NA_real_,
-    deconv_tau_left      = NA_real_,
-    deconv_tau_right     = NA_real_,
-    deconv_k_detected    = if ("deconv_k_detected" %in% names(row)) as.integer(row$deconv_k_detected[1L]) else NA_integer_,
-    deconv_k_fitted      = if ("deconv_k_fitted" %in% names(row)) as.integer(row$deconv_k_fitted[1L]) else NA_integer_
+    clustered            = if ("decomp_attempted" %in% names(row)) isTRUE(row$decomp_attempted[1L]) else FALSE,
+    decomposed           = FALSE,
+    decomp_mu            = NA_real_,
+    decomp_sigma         = NA_real_,
+    decomp_tau_left      = NA_real_,
+    decomp_tau_right     = NA_real_,
+    decomp_k_detected    = if ("decomp_k_detected" %in% names(row)) as.integer(row$decomp_k_detected[1L]) else NA_integer_,
+    decomp_k_fitted      = if ("decomp_k_fitted" %in% names(row)) as.integer(row$decomp_k_fitted[1L]) else NA_integer_
   )
 }
 
@@ -624,17 +624,17 @@ standardize_manual_peak <- function(
     picker_cluster       = NA_integer_,
     picker_resolution    = NA_real_,
     clustered            = FALSE,
-    deconvolved          = FALSE,
-    deconv_mu            = NA_real_,
-    deconv_sigma         = NA_real_,
-    deconv_tau_left      = NA_real_,
-    deconv_tau_right     = NA_real_,
-    deconv_k_detected    = NA_integer_,
-    deconv_k_fitted      = NA_integer_
+    decomposed           = FALSE,
+    decomp_mu            = NA_real_,
+    decomp_sigma         = NA_real_,
+    decomp_tau_left      = NA_real_,
+    decomp_tau_right     = NA_real_,
+    decomp_k_detected    = NA_integer_,
+    decomp_k_fitted      = NA_integer_
   )
 }
 
-# ---------- Cluster deconvolution ---------------------------------------------
+# ---------- Cluster decomposition ---------------------------------------------
 
 ## Order-preserving assignment of k_detected detected peaks to k_fitted >=
 ## k_detected fitted components, minimising the summed |delta rt| (dynamic
@@ -656,7 +656,7 @@ standardize_manual_peak <- function(
   out
 }
 
-add_cluster_deconvolution <- function(
+add_cluster_decomposition <- function(
     proc,
     pk,
     analyte_selection,
@@ -674,27 +674,27 @@ add_cluster_deconvolution <- function(
 
   pk <- copy(pk)
 
-  deconv_cols <- list(
-    deconv_attempted   = FALSE,
-    deconv_accepted    = FALSE,
-    deconv_rt          = NA_real_,
-    deconv_mu          = NA_real_,
-    deconv_height      = NA_real_,
-    deconv_fwhm        = NA_real_,
-    deconv_fwhm_left   = NA_real_,
-    deconv_fwhm_right  = NA_real_,
-    deconv_area        = NA_real_,
-    deconv_sigma       = NA_real_,
-    deconv_tau_left    = NA_real_,
-    deconv_tau_right   = NA_real_,
-    deconv_converged   = NA,
-    deconv_k_detected  = NA_integer_,
-    deconv_k_fitted    = NA_integer_,
-    deconv_count_agree = NA
+  decomp_cols <- list(
+    decomp_attempted   = FALSE,
+    decomp_accepted    = FALSE,
+    decomp_rt          = NA_real_,
+    decomp_mu          = NA_real_,
+    decomp_height      = NA_real_,
+    decomp_fwhm        = NA_real_,
+    decomp_fwhm_left   = NA_real_,
+    decomp_fwhm_right  = NA_real_,
+    decomp_area        = NA_real_,
+    decomp_sigma       = NA_real_,
+    decomp_tau_left    = NA_real_,
+    decomp_tau_right   = NA_real_,
+    decomp_converged   = NA,
+    decomp_k_detected  = NA_integer_,
+    decomp_k_fitted    = NA_integer_,
+    decomp_count_agree = NA
   )
 
-  for (nm in names(deconv_cols)) {
-    if (!nm %in% names(pk)) pk[, (nm) := deconv_cols[[nm]]]
+  for (nm in names(decomp_cols)) {
+    if (!nm %in% names(pk)) pk[, (nm) := decomp_cols[[nm]]]
   }
 
   info <- list(
@@ -723,7 +723,7 @@ add_cluster_deconvolution <- function(
 
   cluster_ids <- clustered$cluster
 
-  ## deconvolve_clusters() expects the original pick_peaks() schema.
+  ## decompose_clusters() expects the original pick_peaks() schema.
   pk_fit <- as.data.frame(sel[cluster %in% cluster_ids])
   if (!"resolution" %in% names(pk_fit) && "picker_resolution" %in% names(pk_fit)) {
     pk_fit$resolution <- pk_fit$picker_resolution
@@ -732,7 +732,7 @@ add_cluster_deconvolution <- function(
   ## BEMG model fitted to the baseline-corrected but UNSMOOTHED trace: least
   ## squares is unbiased under noise, and smoothing would broaden the shapes
   fit <- try(
-    deconvolve_clusters(
+    decompose_clusters(
       x           = proc$time_min,
       y           = proc$intensity_corrected,
       pk          = pk_fit,
@@ -753,8 +753,8 @@ add_cluster_deconvolution <- function(
   for (cid in cluster_ids) {
     rows <- picker_rows[which(pk$cluster[picker_rows] == cid)]
     pk[rows, `:=`(
-      deconv_attempted  = TRUE,
-      deconv_k_detected = as.integer(length(rows))
+      decomp_attempted  = TRUE,
+      decomp_k_detected = as.integer(length(rows))
     )]
   }
 
@@ -771,18 +771,18 @@ add_cluster_deconvolution <- function(
 
   fill_row <- function(r, f) {
     pk[r, `:=`(
-      deconv_accepted   = TRUE,
-      deconv_rt         = as.numeric(f$rt),
-      deconv_mu         = as.numeric(f$mu),
-      deconv_height     = as.numeric(f$height),
-      deconv_fwhm       = as.numeric(f$fwhm),
-      deconv_fwhm_left  = as.numeric(f$fwhm_left),
-      deconv_fwhm_right = as.numeric(f$fwhm_right),
-      deconv_area       = as.numeric(f$area),
-      deconv_sigma      = as.numeric(f$sigma),
-      deconv_tau_left   = as.numeric(f$tau_left),
-      deconv_tau_right  = as.numeric(f$tau_right),
-      deconv_converged  = isTRUE(f$converged)
+      decomp_accepted   = TRUE,
+      decomp_rt         = as.numeric(f$rt),
+      decomp_mu         = as.numeric(f$mu),
+      decomp_height     = as.numeric(f$height),
+      decomp_fwhm       = as.numeric(f$fwhm),
+      decomp_fwhm_left  = as.numeric(f$fwhm_left),
+      decomp_fwhm_right = as.numeric(f$fwhm_right),
+      decomp_area       = as.numeric(f$area),
+      decomp_sigma      = as.numeric(f$sigma),
+      decomp_tau_left   = as.numeric(f$tau_left),
+      decomp_tau_right  = as.numeric(f$tau_right),
+      decomp_converged  = isTRUE(f$converged)
     )]
   }
 
@@ -795,9 +795,9 @@ add_cluster_deconvolution <- function(
     k_fitted   <- nrow(ff)
 
     pk[rows, `:=`(
-      deconv_k_detected  = as.integer(k_detected),
-      deconv_k_fitted    = as.integer(k_fitted),
-      deconv_count_agree = (k_detected == k_fitted)
+      decomp_k_detected  = as.integer(k_detected),
+      decomp_k_fitted    = as.integer(k_fitted),
+      decomp_count_agree = (k_detected == k_fitted)
     )]
 
     if (!k_fitted) {
@@ -884,8 +884,8 @@ add_cluster_deconvolution <- function(
 #'   selection  relative_height_min = 0 (no relative filter; set e.g. 0.25 to
 #'              keep only major peaks, as for enantiomer pairs), max_peaks,
 #'              resolution-based de-duplication (min_peak_resolution = 0.25).
-#'   deconvolution BEMG + BIC with effective sample size, model_tol = 0.01,
-#'              min_fit_rs = 0.35, up to detected + deconv_k_extra components.
+#'   decomposition BEMG + BIC with effective sample size, model_tol = 0.01,
+#'              min_fit_rs = 0.35, up to detected + decomp_k_extra components.
 analyze_one_chromatogram <- function(
     d,
     lookup                    = NULL,
@@ -914,15 +914,15 @@ analyze_one_chromatogram <- function(
     whittaker_args            = list(),
     denoise_method            = "none",
     denoise_args              = list(),
-    deconvolve_clustered      = TRUE,
-    deconv_min_members        = 2L,
-    deconv_pad                = 1.5,
-    deconv_k_max              = 4L,
-    deconv_k_extra            = 2L,
-    deconv_min_snr            = NULL,
-    deconv_require_same_count = TRUE,
-    deconv_model_tol          = 0.01,
-    deconv_min_fit_rs         = 0.35
+    decompose_clustered       = TRUE,
+    decomp_min_members        = 2L,
+    decomp_pad                = 1.5,
+    decomp_k_max              = 4L,
+    decomp_k_extra            = 2L,
+    decomp_min_snr            = NULL,
+    decomp_require_same_count = TRUE,
+    decomp_model_tol          = 0.01,
+    decomp_min_fit_rs         = 0.35
   ) {
 
   baseline_method <- match.arg(baseline_method)
@@ -965,7 +965,7 @@ analyze_one_chromatogram <- function(
   y    <- proc$intensity_corrected
   x    <- proc$time_min
 
-  if (is.null(deconv_min_snr)) deconv_min_snr <- snr_min
+  if (is.null(decomp_min_snr)) decomp_min_snr <- snr_min
 
   analyte_region <- which(x > analyte_lower_limit)
 
@@ -1221,33 +1221,33 @@ analyze_one_chromatogram <- function(
 
   ## ----- EGH refit for clustered, already-detected analyte peaks -----------
 
-  deconv_info <- add_cluster_deconvolution(
+  decomp_info <- add_cluster_decomposition(
     proc               = proc,
     pk                 = pk,
     analyte_selection  = analyte_selection,
-    enabled            = deconvolve_clustered,
-    min_members        = deconv_min_members,
-    pad                = deconv_pad,
-    k_max              = deconv_k_max,
-    k_extra            = deconv_k_extra,
-    min_snr            = deconv_min_snr,
-    require_same_count = deconv_require_same_count,
-    model_tol          = deconv_model_tol,
-    min_fit_rs         = deconv_min_fit_rs,
+    enabled            = decompose_clustered,
+    min_members        = decomp_min_members,
+    pad                = decomp_pad,
+    k_max              = decomp_k_max,
+    k_extra            = decomp_k_extra,
+    min_snr            = decomp_min_snr,
+    require_same_count = decomp_require_same_count,
+    model_tol          = decomp_model_tol,
+    min_fit_rs         = decomp_min_fit_rs,
     noise_sd           = noise_sd
   )
-  pk <- deconv_info$pk
+  pk <- decomp_info$pk
 
-  ## [NEW] BIC-proposed hidden components (deconv_require_same_count = FALSE)
+  ## [NEW] BIC-proposed hidden components (decomp_require_same_count = FALSE)
   ## join the analyte list, still subject to max_peaks (strongest kept).
-  if (length(deconv_info$hidden_rows)) {
-    hid <- deconv_info$hidden_rows
+  if (length(decomp_info$hidden_rows)) {
+    hid <- decomp_info$hidden_rows
     analyte_selection <- rbind(
       analyte_selection,
       data.table(
         idx        = as.integer(pk$idx[hid]),
         picker_row = as.integer(hid),
-        source     = "deconvolution_hidden"
+        source     = "decomposition_hidden"
       )
     )
     analyte_selection <- unique(analyte_selection, by = "idx")
@@ -1255,7 +1255,7 @@ analyze_one_chromatogram <- function(
       h_sel <- vapply(seq_len(nrow(analyte_selection)), function(j) {
         r <- analyte_selection$picker_row[j]
         if (is.finite(r)) {
-          if (isTRUE(pk$deconv_accepted[r])) pk$deconv_height[r] else pk$height[r]
+          if (isTRUE(pk$decomp_accepted[r])) pk$decomp_height[r] else pk$height[r]
         } else y_sel[analyte_selection$idx[j]]
       }, numeric(1))
       analyte_selection <- analyte_selection[order(-h_sel)][seq_len(max_peaks)]
@@ -1352,13 +1352,13 @@ analyze_one_chromatogram <- function(
       picker_cluster       = integer(),
       picker_resolution    = numeric(),
       clustered            = logical(),
-      deconvolved          = logical(),
-      deconv_mu            = numeric(),
-      deconv_sigma         = numeric(),
-      deconv_tau_left      = numeric(),
-      deconv_tau_right     = numeric(),
-      deconv_k_detected    = integer(),
-      deconv_k_fitted      = integer(),
+      decomposed           = logical(),
+      decomp_mu            = numeric(),
+      decomp_sigma         = numeric(),
+      decomp_tau_left      = numeric(),
+      decomp_tau_right     = numeric(),
+      decomp_k_detected    = integer(),
+      decomp_k_fitted      = integer(),
       k                    = numeric()
     )
   }
@@ -1391,12 +1391,12 @@ analyze_one_chromatogram <- function(
   saturated_any <- nrow(peaks[peak_type == "analyte"]) > 0L &&
     any(peaks[peak_type == "analyte", saturated])
 
-  clustered_any                        <- length(deconv_info$attempted_clusters) > 0L
-  deconvolution_applied_any            <- length(deconv_info$accepted_clusters) > 0L
-  deconvolution_count_disagreement_any <- length(deconv_info$disagreement_clusters) > 0L
-  deconvolution_failed_any             <- length(deconv_info$failed_clusters) > 0L
-  deconvolution_hidden_any             <- nrow(peaks) > 0L &&
-    any(peaks$peak_source == "deconvolution_hidden")
+  clustered_any                        <- length(decomp_info$attempted_clusters) > 0L
+  decomposition_applied_any            <- length(decomp_info$accepted_clusters) > 0L
+  decomposition_count_disagreement_any <- length(decomp_info$disagreement_clusters) > 0L
+  decomposition_failed_any             <- length(decomp_info$failed_clusters) > 0L
+  decomposition_hidden_any             <- nrow(peaks) > 0L &&
+    any(peaks$peak_source == "decomposition_hidden")
 
   qc_status <- if (excluded) {
     "excluded"
@@ -1404,12 +1404,12 @@ analyze_one_chromatogram <- function(
     "review_no_analyte_peak"
   } else if (isTRUE(look_for_t0) && !t0_marker_found && !t0_available) {
     "review_no_t0"
-  } else if (deconvolution_count_disagreement_any) {
-    "review_deconvolution_count"
-  } else if (deconvolution_failed_any) {
-    "review_deconvolution_fit"
-  } else if (deconvolution_hidden_any) {
-    "review_deconvolution_hidden"
+  } else if (decomposition_count_disagreement_any) {
+    "review_decomposition_count"
+  } else if (decomposition_failed_any) {
+    "review_decomposition_fit"
+  } else if (decomposition_hidden_any) {
+    "review_decomposition_hidden"
   } else if (fwhm_review_any) {
     "review_fwhm"
   } else if (saturated_any) {
@@ -1456,15 +1456,15 @@ analyze_one_chromatogram <- function(
   hyper$min_peak_resolution   <- if (is.null(min_peak_distance_min)) min_peak_resolution else NA_real_
   hyper$min_peak_distance_min <- if (is.null(min_peak_distance_min)) NA_real_ else min_peak_distance_min
   hyper$max_peaks             <- max_peaks
-  hyper$deconvolution         <- list(
-    enabled            = deconvolve_clustered,
-    min_members        = deconv_min_members,
-    k_max              = deconv_k_max,
-    k_extra            = deconv_k_extra,
-    min_snr            = deconv_min_snr,
-    require_same_count = deconv_require_same_count,
-    model_tol          = deconv_model_tol,
-    min_fit_rs         = deconv_min_fit_rs
+  hyper$decomposition         <- list(
+    enabled            = decompose_clustered,
+    min_members        = decomp_min_members,
+    k_max              = decomp_k_max,
+    k_extra            = decomp_k_extra,
+    min_snr            = decomp_min_snr,
+    require_same_count = decomp_require_same_count,
+    model_tol          = decomp_model_tol,
+    min_fit_rs         = decomp_min_fit_rs
   )
 
   run_summary <- run_meta[, .(
@@ -1496,10 +1496,10 @@ analyze_one_chromatogram <- function(
     fwhm_review_any,
     saturated_any,
     clustered_any,
-    deconvolution_applied_any,
-    deconvolution_count_disagreement_any,
-    deconvolution_failed_any,
-    deconvolution_hidden_any,
+    decomposition_applied_any,
+    decomposition_count_disagreement_any,
+    decomposition_failed_any,
+    decomposition_hidden_any,
     peak_detection_ok = n_peaks >= 1L && !excluded && (!look_for_t0 || t0_marker_found || t0_available),
     noise_sd,
     max_analyte_signal,
@@ -1526,7 +1526,7 @@ analyze_one_chromatogram <- function(
     candidates      = pk,
     peaks           = peaks,
     run             = run_summary,
-    deconvolution   = deconv_info
+    decomposition   = decomp_info
   )
 }
 
@@ -1581,7 +1581,7 @@ plot_peak_qc <- function(result) {
   }
 
   ## [NEW] fitted BEMG components of accepted clusters, drawn on the baseline
-  dec <- result$deconvolution
+  dec <- result$decomposition
   if (!is.null(dec) && !is.null(dec$fit) && length(dec$accepted_clusters)) {
     ff <- as.data.table(dec$fit)[cluster %in% dec$accepted_clusters]
     if (nrow(ff)) {
@@ -1617,8 +1617,8 @@ plot_peak_qc <- function(result) {
         peak_index,
         tR_min,
         fifelse(is.finite(fwhm_min), sprintf("%.3f", fwhm_min), "NA"),
-        fifelse(peak_source == "deconvolution_hidden", " [BEMG, hidden]",
-                fifelse(deconvolved, " [BEMG]", ""))
+        fifelse(peak_source == "decomposition_hidden", " [BEMG, hidden]",
+                fifelse(decomposed, " [BEMG]", ""))
       )
     )]
     
@@ -2294,15 +2294,15 @@ analyze_chrom_folder <- function(
     whittaker_args                     = list(),
     denoise_method                     = "none",
     denoise_args                       = list(),
-    deconvolve_clustered               = TRUE,
-    deconv_min_members                 = 2L,
-    deconv_pad                         = 1.5,
-    deconv_k_max                       = 4L,
-    deconv_k_extra                     = 2L,
-    deconv_min_snr                     = NULL,
-    deconv_require_same_count          = TRUE,
-    deconv_model_tol                   = 0.01,
-    deconv_min_fit_rs                  = 0.35,
+    decompose_clustered                = TRUE,
+    decomp_min_members                 = 2L,
+    decomp_pad                         = 1.5,
+    decomp_k_max                       = 4L,
+    decomp_k_extra                     = 2L,
+    decomp_min_snr                     = NULL,
+    decomp_require_same_count          = TRUE,
+    decomp_model_tol                   = 0.01,
+    decomp_min_fit_rs                  = 0.35,
     lookup_filename                    = "peakfinder_lookup.csv",
     create_lookup_template             = TRUE,
     overwrite_lookup_template          = FALSE,
@@ -2365,15 +2365,15 @@ analyze_chrom_folder <- function(
     whittaker_args            = whittaker_args,
     denoise_method            = match.arg(denoise_method, DENOISE_METHODS),
     denoise_args              = denoise_args,
-    deconvolve_clustered      = deconvolve_clustered,
-    deconv_min_members        = deconv_min_members,
-    deconv_pad                = deconv_pad,
-    deconv_k_max              = deconv_k_max,
-    deconv_k_extra            = deconv_k_extra,
-    deconv_min_snr            = deconv_min_snr,
-    deconv_require_same_count = deconv_require_same_count,
-    deconv_model_tol          = deconv_model_tol,
-    deconv_min_fit_rs         = deconv_min_fit_rs
+    decompose_clustered       = decompose_clustered,
+    decomp_min_members        = decomp_min_members,
+    decomp_pad                = decomp_pad,
+    decomp_k_max              = decomp_k_max,
+    decomp_k_extra            = decomp_k_extra,
+    decomp_min_snr            = decomp_min_snr,
+    decomp_require_same_count = decomp_require_same_count,
+    decomp_model_tol          = decomp_model_tol,
+    decomp_min_fit_rs         = decomp_min_fit_rs
   )
 
   record_ids <- unique(raw$record_uid)
@@ -2572,15 +2572,15 @@ analyze_chrom_folder_chunked <- function(
     whittaker_args                     = list(),
     denoise_method                     = "none",
     denoise_args                       = list(),
-    deconvolve_clustered               = TRUE,
-    deconv_min_members                 = 2L,
-    deconv_pad                         = 1.5,
-    deconv_k_max                       = 4L,
-    deconv_k_extra                     = 2L,
-    deconv_min_snr                     = NULL,
-    deconv_require_same_count          = TRUE,
-    deconv_model_tol                   = 0.01,
-    deconv_min_fit_rs                  = 0.35,
+    decompose_clustered                = TRUE,
+    decomp_min_members                 = 2L,
+    decomp_pad                         = 1.5,
+    decomp_k_max                       = 4L,
+    decomp_k_extra                     = 2L,
+    decomp_min_snr                     = NULL,
+    decomp_require_same_count          = TRUE,
+    decomp_model_tol                   = 0.01,
+    decomp_min_fit_rs                  = 0.35,
     
     lookup_filename                    = "peakfinder_lookup.csv",
     create_lookup_template             = TRUE,
@@ -2647,15 +2647,15 @@ analyze_chrom_folder_chunked <- function(
     whittaker_args            = whittaker_args,
     denoise_method            = match.arg(denoise_method, DENOISE_METHODS),
     denoise_args              = denoise_args,
-    deconvolve_clustered      = deconvolve_clustered,
-    deconv_min_members        = deconv_min_members,
-    deconv_pad                = deconv_pad,
-    deconv_k_max              = deconv_k_max,
-    deconv_k_extra            = deconv_k_extra,
-    deconv_min_snr            = deconv_min_snr,
-    deconv_require_same_count = deconv_require_same_count,
-    deconv_model_tol          = deconv_model_tol,
-    deconv_min_fit_rs         = deconv_min_fit_rs
+    decompose_clustered       = decompose_clustered,
+    decomp_min_members        = decomp_min_members,
+    decomp_pad                = decomp_pad,
+    decomp_k_max              = decomp_k_max,
+    decomp_k_extra            = decomp_k_extra,
+    decomp_min_snr            = decomp_min_snr,
+    decomp_require_same_count = decomp_require_same_count,
+    decomp_model_tol          = decomp_model_tol,
+    decomp_min_fit_rs         = decomp_min_fit_rs
   )
   
   ids <- cmp$meta$record_uid
@@ -2671,7 +2671,7 @@ analyze_chrom_folder_chunked <- function(
   )
   
   ## Accumulate the per-record objects, not combined tables. Only
-  ## processed_trace is heavy; candidates / peaks / run / deconvolution are
+  ## processed_trace is heavy; candidates / peaks / run / decomposition are
   ## small, so keeping them costs almost nothing and keeps the output identical.
   results <- vector("list", n)
   names(results) <- ids
